@@ -1,0 +1,22 @@
+package domain
+
+import "time"
+
+// WalletEvent represents a blockchain event (e.g., ERC-20 Transfer)
+// associated with a tracked wallet.
+//
+// Events are detected by the event-watcher and persisted for auditing
+// and future tax reporting purposes.
+type WalletEvent struct {
+	ID              string    `json:"id" db:"id"`
+	WalletID        string    `json:"wallet_id" db:"wallet_id"`
+	TxHash          string    `json:"tx_hash" db:"tx_hash"`
+	BlockNumber     uint64    `json:"block_number" db:"block_number"`
+	ContractAddress string    `json:"contract_address" db:"contract_address"`
+	EventType       string    `json:"event_type" db:"event_type"`       // e.g. "transfer"
+	Direction       string    `json:"direction" db:"direction"`         // "incoming" or "outgoing"
+	Amount          string    `json:"amount" db:"amount"`               // string to preserve precision
+	TokenSymbol     string    `json:"token_symbol" db:"token_symbol"`
+	RawPayload      string    `json:"raw_payload" db:"raw_payload"`
+	CreatedAt       time.Time `json:"created_at" db:"created_at"`
+}
