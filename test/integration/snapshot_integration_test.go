@@ -89,7 +89,7 @@ func TestSnapshotRunner_AgainstSeededChain(t *testing.T) {
 			got, present := tokens[sym]
 			require.Truef(t, present,
 				"wallet %s missing bootstrap token %s", walletID, sym)
-			floor := fixtureTokensToHumanUnits(fx.Amount, fx.Decimals)
+			floor := fixtureTokensToHumanUnits(t, fx.Amount, fx.Decimals)
 			require.GreaterOrEqualf(t, got, floor,
 				"wallet %s / %s: bootstrap transferred %.2f, got %.2f (regression?)",
 				walletID, sym, floor, got)
@@ -120,8 +120,16 @@ func countETHWallets(ctx context.Context, t *testing.T) int {
 // fixtureTokensToHumanUnits turns a raw uint256 amount ("1000000000") plus
 // decimals (6) into a float for comparison with the snapshot's Amount
 // (which the provider already scales by 10^decimals).
-func fixtureTokensToHumanUnits(rawAmount string, decimals int) float64 {
-	raw, _ := new(big.Int).SetString(rawAmount, 10)
+//
+// Malformed fixture data (e.g. non-decimal Amount) trips t.Fatalf instead
+// of a confusing nil-deref panic deep in big.Float. Loader validation in
+// testenv should also catch this earlier.
+func fixtureTokensToHumanUnits(t *testing.T, rawAmount string, decimals int) float64 {
+	t.Helper()
+	raw, ok := new(big.Int).SetString(rawAmount, 10)
+	if !ok {
+		t.Fatalf("invalid fixture amount %q (expected base-10 uint256)", rawAmount)
+	}
 	f := new(big.Float).SetInt(raw)
 	f.Quo(f, big.NewFloat(math.Pow10(decimals)))
 	v, _ := f.Float64()

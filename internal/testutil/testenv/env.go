@@ -191,6 +191,10 @@ func Setup(ctx context.Context, opts ...Options) (*Env, error) {
 		return nil, fmt.Errorf("testenv.Setup: postgres: %w", pg.err)
 	}
 	if av.err != nil {
+		// Even when av.err is non-nil, av.h may be populated if Anvil booted
+		// far enough to hand back a container before the error surfaced.
+		// cleanup() is a no-op when av.h is nil, so calling it is safe.
+		cleanup()
 		return nil, fmt.Errorf("testenv.Setup: anvil fork: %w", av.err)
 	}
 
@@ -199,11 +203,20 @@ func Setup(ctx context.Context, opts ...Options) (*Env, error) {
 		cleanup()
 		return nil, fmt.Errorf("testenv.Setup: open postgres: %w", err)
 	}
-	if err := db.PingContext(ctx); err != nil {
+	// bootCtx (not caller ctx) enforces StartupTimeout end-to-end: if anything
+	// after the container boot hangs, it trips the same deadline that capped
+	// container startup.
+	if err := db.PingContext(bootCtx); err != nil {
 		_ = db.Close()
 		cleanup()
 		return nil, fmt.Errorf("testenv.Setup: ping postgres: %w", err)
 	}
+	// NOTE: golang-migrate's migrate.Up has no context parameter (see
+	// migrate/v4). The boot timeout still applies to the surrounding Setup
+	// call — if migrations hang, the Go runtime has no way to unblock them
+	// here short of killing the process. A pragmatic fix would be to wrap
+	// RunMigrations in a goroutine + select, but that is overkill given how
+	// small our migration set is.
 	if err := postgres.RunMigrations(db); err != nil {
 		_ = db.Close()
 		cleanup()
@@ -225,7 +238,7 @@ func Setup(ctx context.Context, opts ...Options) (*Env, error) {
 	}
 
 	if !opt.SkipBootstrap {
-		if err := env.BootstrapChainFromDB(ctx); err != nil {
+		if err := env.BootstrapChainFromDB(bootCtx); err != nil {
 			_ = db.Close()
 			cleanup()
 			return nil, fmt.Errorf("testenv.Setup: bootstrap: %w", err)

@@ -22,7 +22,9 @@ import (
 // testenv.Setup has already:
 //
 //   - Migrated Postgres (migration 002 seeds two ETH wallets).
-//   - Forked mainnet at a pinned block via Anvil.
+//   - Forked mainnet via Anvil (defaults to the RPC's latest block;
+//     Options.ForkBlock pins a specific block when supplied and the RPC
+//     retains archive state for it).
 //   - Seeded each distinct tracked address with 10 ETH + bootstrap tokens.
 //
 // This test picks one of those addresses, fires a fresh USDC Transfer from
@@ -73,7 +75,9 @@ func TestWatcherForkedMainnetUSDCTransfer(t *testing.T) {
 				t.Logf("watcher exited with: %v", err)
 			}
 		case <-time.After(5 * time.Second):
-			t.Log("watcher did not exit within 5s after cancel")
+			// Failing here surfaces goroutine leaks instead of letting them
+			// silently flake the next test in the suite.
+			t.Errorf("watcher did not exit within 5s after cancel")
 		}
 	})
 

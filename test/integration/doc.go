@@ -1,9 +1,10 @@
 // Package integration holds end-to-end tests for portfolio-api.
 //
-// These tests spin up real Postgres and Anvil containers via
-// internal/testutil/containers and exercise the existing watcher / snapshot
-// code paths against them. They are gated behind the `integration` build
-// tag to keep `go test ./...` fast by default.
+// The environment (Postgres + forked-mainnet Anvil + DB-driven chain
+// bootstrap) is orchestrated by internal/testutil/testenv. Each test file
+// leans on a shared `env` value populated in TestMain via `testenv.Setup`.
+// Tests are gated behind the `integration` build tag so `go test ./...`
+// stays fast by default.
 //
 // Run them with:
 //
@@ -12,6 +13,6 @@
 //
 // Prerequisites:
 //   - Docker daemon reachable by testcontainers-go.
-//   - The anvil test image builds from test/infrastructure/anvil/Dockerfile —
-//     testcontainers handles the build lazily; the first run is slow.
+//   - The Anvil test image builds from test/infrastructure/anvil/Dockerfile
+//     (embedded via go:embed); testcontainers caches it after the first run.
 package integration
