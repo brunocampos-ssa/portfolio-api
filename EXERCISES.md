@@ -1,11 +1,13 @@
-# Exercicios: Concorrencia Avancada em Go
+# Exercises: Advanced Concurrency in Go
 
-Estes exercicios estendem o projeto `portfolio-api` com foco nos binarios `event-watcher`
-e `snapshot-runner`. Cada exercicio pede que voce modifique ou estenda arquivos reais
-do codebase. Trabalhe na ordem — exercicios posteriores assumem que os anteriores
-foram concluidos.
+> [Leia em Português](EXERCISES.pt-BR.md)
 
-Antes de comecar, certifique-se de que o projeto compila e os testes existentes passam:
+These exercises extend the `portfolio-api` project with a focus on the
+`event-watcher` and `snapshot-runner` binaries. Each exercise asks you to
+modify or extend real files in the codebase. Work through them in order —
+later exercises assume earlier ones are done.
+
+Before you start, make sure the project builds and the existing tests pass:
 
 ```bash
 go build ./...
@@ -14,126 +16,130 @@ go test ./...
 
 ---
 
-## Sumario
+## Contents
 
-| #  | Titulo | Dificuldade | Conceitos-Chave |
-|----|--------|-------------|-----------------|
-| 1  | [Adicionar um consumer de alerta ao fan-out](#exercicio-1-adicionar-um-consumer-de-alerta-ao-fan-out) | Iniciante | Fan-out broadcast, channels direcionais, `select` |
-| 2  | [Adicionar coluna `total_usd` ao snapshot](#exercicio-2-adicionar-coluna-total_usd-ao-snapshot) | Iniciante | Pipeline de dados, agregacao, migracao SQL |
-| 3  | [Contar eventos por token no metrics worker](#exercicio-3-contar-eventos-por-token-no-metrics-worker) | Iniciante | `select` com multiplos canais, `map` como acumulador |
-| 4  | [Rate limiter para o worker pool](#exercicio-4-rate-limiter-para-o-worker-pool) | Intermediario | `time.Ticker` como semaforo, bounded concurrency |
-| 5  | [Retry com backoff exponencial no LogsFetcher](#exercicio-5-retry-com-backoff-exponencial-no-logsfetcher) | Intermediario | Decorator pattern, `time.After`, `select` com `ctx.Done()` |
-| 6  | [Teste de integracao do pipeline do watcher](#exercicio-6-teste-de-integracao-do-pipeline-do-watcher) | Intermediario | Mocks, pipeline end-to-end, channel draining |
-| 7  | [Stage de deduplicacao no watcher](#exercicio-7-stage-de-deduplicacao-no-watcher) | Intermediario | `concurrent.Stage`, map como filtro stateful |
-| 8  | [Worker pool dinamico baseado em queue depth](#exercicio-8-worker-pool-dinamico-baseado-em-queue-depth) | Avancado | Goroutines dinamicas, `len(ch)`/`cap(ch)`, `sync.WaitGroup` |
-| 9  | [Substituir polling por WebSocket](#exercicio-9-substituir-polling-por-websocket) | Avancado | `gorilla/websocket`, `eth_subscribe`, composicao de canais |
-| 10 | [Timeout por wallet no snapshot runner](#exercicio-10-timeout-por-wallet-no-snapshot-runner) | Avancado | `context.WithTimeout`, partial failure, `select` |
-| 11 | [Benchmark comparando tamanhos de worker pool](#exercicio-11-benchmark-comparando-tamanhos-de-worker-pool) | Avancado | `testing.B`, benchmark parametrizado, analise de throughput |
-| 12 | [Modo "diff" no snapshot runner (Desafio)](#exercicio-12-modo-diff-no-snapshot-runner-desafio) | Avancado | Pipeline composto, comparacao de snapshots, fan-in |
+| #  | Title | Difficulty | Key concepts |
+|----|-------|------------|--------------|
+| 1  | [Add an alert consumer to the fan-out](#exercise-1-add-an-alert-consumer-to-the-fan-out) | Beginner | Fan-out broadcast, directional channels, `select` |
+| 2  | [Add a `total_usd` column to the snapshot](#exercise-2-add-a-total_usd-column-to-the-snapshot) | Beginner | Data pipeline, aggregation, SQL migration |
+| 3  | [Count events per token in the metrics worker](#exercise-3-count-events-per-token-in-the-metrics-worker) | Beginner | `select` over multiple channels, `map` as accumulator |
+| 4  | [Rate limiter for the worker pool](#exercise-4-rate-limiter-for-the-worker-pool) | Intermediate | `time.Ticker` as a semaphore, bounded concurrency |
+| 5  | [Exponential-backoff retry for the LogsFetcher](#exercise-5-exponential-backoff-retry-for-the-logsfetcher) | Intermediate | Decorator pattern, `time.After`, `select` with `ctx.Done()` |
+| 6  | [Integration test for the watcher pipeline](#exercise-6-integration-test-for-the-watcher-pipeline) | Intermediate | Mocks, end-to-end pipeline, channel draining |
+| 7  | [Deduplication stage in the watcher](#exercise-7-deduplication-stage-in-the-watcher) | Intermediate | `concurrent.Stage`, map as a stateful filter |
+| 8  | [Dynamic worker pool based on queue depth](#exercise-8-dynamic-worker-pool-based-on-queue-depth) | Advanced | Dynamic goroutines, `len(ch)`/`cap(ch)`, `sync.WaitGroup` |
+| 9  | [Replace polling with WebSockets](#exercise-9-replace-polling-with-websockets) | Advanced | `gorilla/websocket`, `eth_subscribe`, channel composition |
+| 10 | [Per-wallet timeout in the snapshot runner](#exercise-10-per-wallet-timeout-in-the-snapshot-runner) | Advanced | `context.WithTimeout`, partial failure, `select` |
+| 11 | [Benchmark different worker pool sizes](#exercise-11-benchmark-different-worker-pool-sizes) | Advanced | `testing.B`, parametrized benchmarks, throughput analysis |
+| 12 | ["diff" mode for the snapshot runner (Challenge)](#exercise-12-diff-mode-for-the-snapshot-runner-challenge) | Advanced | Composed pipeline, snapshot comparison, fan-in |
 
 ---
 
-## Exercicio 1: Adicionar um consumer de alerta ao fan-out
+## Exercise 1: Add an alert consumer to the fan-out
 
-**Dificuldade:** Iniciante
+**Difficulty:** Beginner
 
-### Conceito
+### Concept
 
-O `FanOut` em `internal/concurrent/fanout.go` transmite cada evento para **todos**
-os consumers registrados (broadcast). Atualmente o watcher tem 3 consumers: `persistWorker`,
-`logWorker` e `metricsWorker`. Neste exercicio voce adicionara um quarto consumer
-que funciona como um sistema de alertas simples.
+`FanOut` in `internal/concurrent/fanout.go` broadcasts every event to **all**
+registered consumers. The watcher currently has 3 consumers: `persistWorker`,
+`logWorker`, and `metricsWorker`. In this exercise you'll add a fourth
+consumer that acts as a simple alerting system.
 
-O ponto-chave e entender que adicionar um consumer ao fan-out e trivial: basta
-aumentar o `numConsumers` na chamada a `concurrent.FanOut` e consumir o canal
-adicional. Cada consumer recebe **todos** os eventos independentemente dos demais.
+The key insight is that adding a consumer to the fan-out is trivial: bump
+`numConsumers` in the call to `concurrent.FanOut` and drain the extra
+channel. Each consumer sees **every** event independently of the others.
 
-### Instrucoes
+### Instructions
 
-1. **`internal/watcher/watcher.go`** — No metodo `Run`, altere a chamada a `FanOut`
-   de 3 para 4 consumers:
+1. **`internal/watcher/watcher.go`** — In `Run`, change the `FanOut` call
+   from 3 to 4 consumers:
 
    ```go
    consumers := concurrent.FanOut(ctx, normalized, 4)
    ```
 
-2. **`internal/watcher/watcher.go`** — Adicione o novo consumer:
+2. **`internal/watcher/watcher.go`** — Add the new consumer:
 
    ```go
    go w.alertWorker(ctx, consumers[3])
    ```
 
-3. **`internal/watcher/watcher.go`** — Implemente o metodo `alertWorker`:
+3. **`internal/watcher/watcher.go`** — Implement the `alertWorker` method:
 
    ```go
    func (w *Watcher) alertWorker(_ context.Context, events <-chan *domain.WalletEvent) {
-       const threshold = 1000.0 // USD threshold — ajuste conforme necessario
+       const threshold = 1000.0 // USD threshold — tune as needed
 
        for event := range events {
-           // Parse o amount do evento e compare com o threshold.
-           // Se exceder, logue um alerta.
+           // Parse event.Amount and compare to threshold.
+           // Log an alert when it exceeds.
        }
        log.Println("watcher: alert worker done")
    }
    ```
 
-   O worker deve parsear `event.Amount` (que e uma string, ex: `"1500.250000"`) usando
-   `strconv.ParseFloat`, e logar uma mensagem de alerta quando o valor exceder o threshold.
+   The worker should parse `event.Amount` (a string, e.g. `"1500.250000"`)
+   with `strconv.ParseFloat`, and log an alert when the amount exceeds the
+   threshold.
 
-### Dica
+### Hint
 
-- Observe que o `alertWorker` **nao** fecha o canal — ele e um consumer. O canal e
-  criado e fechado pelo `FanOut`. Essa e a regra de ownership: quem cria o canal e
-  responsavel por fecha-lo.
-- Use `strconv.ParseFloat(event.Amount, 64)` para converter o amount. Trate erros
-  de parse silenciosamente com `continue`.
-- O alerta pode ser um simples `log.Printf` com prefixo `[ALERT]`.
+- Note that `alertWorker` does **not** close the channel — it is a consumer.
+  The channel is created and closed by `FanOut`. That's the ownership rule:
+  the producer that creates a channel is responsible for closing it.
+- Use `strconv.ParseFloat(event.Amount, 64)` to convert the amount. Silently
+  skip parse errors with `continue`.
+- The alert can be a simple `log.Printf` with an `[ALERT]` prefix.
 
-### Validacao
+### Acceptance
 
-- `go build ./...` compila sem erros.
-- Execute o `event-watcher` com wallets cadastradas no banco. Quando um Transfer
-  com valor alto for detectado, a mensagem `[ALERT]` deve aparecer no log.
-- Verifique que os outros 3 workers (persist, log, metrics) continuam funcionando
-  normalmente — o novo consumer nao deve afetar os demais.
-- Escreva um teste unitario que cria um canal, envia um evento com `Amount: "2000.000000"`
-  e verifica que o `alertWorker` nao entra em deadlock (o canal fecha apos o envio).
+- `go build ./...` compiles with no errors.
+- Run the `event-watcher` with wallets seeded in the database. When a
+  high-value Transfer is detected, the `[ALERT]` message appears in the log.
+- Verify that the other 3 workers (persist, log, metrics) keep working
+  normally — the new consumer must not affect them.
+- Write a unit test that creates a channel, sends an event with
+  `Amount: "2000.000000"`, and verifies that `alertWorker` does not deadlock
+  (the channel closes after the send).
 
 ---
 
-## Exercicio 2: Adicionar coluna `total_usd` ao snapshot
+## Exercise 2: Add a `total_usd` column to the snapshot
 
-**Dificuldade:** Iniciante
+**Difficulty:** Beginner
 
-### Conceito
+### Concept
 
-O snapshot runner em `internal/snapshot/runner.go` ja calcula o `USDValue` de cada
-`WalletSnapshotItem`, mas nao armazena o total agregado no registro `WalletSnapshot`.
-Neste exercicio voce adicionara um campo `TotalUSD` ao domain e uma coluna correspondente
-na tabela do banco de dados.
+The snapshot runner in `internal/snapshot/runner.go` already computes
+`USDValue` for each `WalletSnapshotItem`, but does not store the aggregate
+total in the `WalletSnapshot` record. In this exercise you'll add a
+`TotalUSD` field to the domain type and a matching column in the database.
 
-Este exercicio reforça como dados fluem pelo pipeline: os resultados do worker pool
-sao agregados no stage 4 (coleta), e e nesse ponto que voce calculara o total.
+This reinforces how data flows through the pipeline: the worker pool's
+results are aggregated in stage 4 (collection), and that is the natural
+place to compute the total.
 
-### Instrucoes
+### Instructions
 
-1. **`migrations/005_add_total_usd.sql`** — Crie uma nova migracao:
+1. **`migrations/005_add_total_usd.sql`** — Create a new migration:
 
    ```sql
    ALTER TABLE wallet_snapshots ADD COLUMN total_usd DOUBLE PRECISION NOT NULL DEFAULT 0;
    ```
 
-2. **`internal/domain/snapshot.go`** — Adicione o campo ao struct:
+2. **`internal/domain/snapshot.go`** — Add the field to the struct:
 
    ```go
    type WalletSnapshot struct {
-       // ... campos existentes ...
+       // ... existing fields ...
        TotalUSD      float64              `json:"total_usd" db:"total_usd"`
    }
    ```
 
-3. **`internal/snapshot/runner.go`** — No stage 4 (apos o loop `for result := range resultCh`),
-   calcule o total somando `USDValue` de todos os items:
+3. **`internal/snapshot/runner.go`** — In stage 4 (after the
+   `for result := range resultCh` loop), compute the total by summing
+   `USDValue` across every item:
 
    ```go
    var totalUSD float64
@@ -143,102 +149,108 @@ sao agregados no stage 4 (coleta), e e nesse ponto que voce calculara o total.
    snapshot.TotalUSD = totalUSD
    ```
 
-4. **`internal/repository/postgres/snapshot_repository.go`** — Atualize as queries SQL
-   para incluir a nova coluna `total_usd` no `INSERT` e no `UPDATE` do status.
+4. **`internal/repository/postgres/snapshot_repository.go`** — Update the
+   SQL queries to include the new `total_usd` column on `INSERT` and on
+   the status `UPDATE`.
 
-### Dica
+### Hint
 
-- A soma deve acontecer **depois** que todos os resultados do worker pool foram coletados,
-  ou seja, apos o `for result := range resultCh` terminar. Esse e o ponto onde o fan-in
-  ja convergiu todos os resultados em uma unica goroutine.
-- Lembre-se de que o canal `resultCh` so fecha quando **todos** os workers terminam
-  (via `sync.WaitGroup` dentro de `RunWorkerPool`). Entao quando o `range` termina,
-  voce tem a garantia de que todos os dados estao em `allItems`.
+- The sum must happen **after** all worker-pool results have been collected
+  — i.e. after `for result := range resultCh` returns. That is the point
+  where the fan-in has already converged every result into a single
+  goroutine.
+- Remember that `resultCh` only closes once **every** worker is done (via
+  the internal `sync.WaitGroup` in `RunWorkerPool`). So when the `range`
+  loop exits, you are guaranteed that every result sits in `allItems`.
 
-### Validacao
+### Acceptance
 
-- Execute a migracao: `psql $DATABASE_URL -f migrations/005_add_total_usd.sql`.
-- Execute `go run ./cmd/snapshot-runner` e verifique no JSON de saida que o campo
-  `total_usd` aparece com a soma correta dos `usd_value` de todos os items.
-- Consulte o banco: `SELECT id, total_usd, status FROM wallet_snapshots ORDER BY created_at DESC LIMIT 1;`
-  e confirme que o valor esta persistido.
+- Run the migration: `psql $DATABASE_URL -f migrations/005_add_total_usd.sql`.
+- Run `go run ./cmd/snapshot-runner` and verify in the JSON output that
+  `total_usd` appears with the correct sum of `usd_value` over all items.
+- Query the database:
+  `SELECT id, total_usd, status FROM wallet_snapshots ORDER BY created_at DESC LIMIT 1;`
+  and confirm the value was persisted.
 
 ---
 
-## Exercicio 3: Contar eventos por token no metrics worker
+## Exercise 3: Count events per token in the metrics worker
 
-**Dificuldade:** Iniciante
+**Difficulty:** Beginner
 
-### Conceito
+### Concept
 
-O `metricsWorker` em `internal/watcher/watcher.go` ja conta eventos por `Direction`
-(incoming/outgoing) usando um `select` que multiplexa entre o canal de eventos e um
-`time.Ticker`. Neste exercicio voce adicionara contagem por `TokenSymbol`, aprendendo
-a usar um `map` como acumulador dentro de um loop com `select`.
+`metricsWorker` in `internal/watcher/watcher.go` already counts events by
+`Direction` (incoming/outgoing) using a `select` that multiplexes between
+the events channel and a `time.Ticker`. In this exercise you'll add a
+per-`TokenSymbol` count, learning how to use a `map` as an accumulator
+inside a `select` loop.
 
-### Instrucoes
+### Instructions
 
-1. **`internal/watcher/watcher.go`** — No `metricsWorker`, adicione um mapa para
-   contar por token:
+1. **`internal/watcher/watcher.go`** — In `metricsWorker`, add a map to
+   count by token:
 
    ```go
    byToken := make(map[string]int)
    ```
 
-2. Dentro do `case event, ok := <-events:`, apos o switch de direction, incremente
-   o contador do token:
+2. Inside `case event, ok := <-events:`, after the direction switch,
+   increment the token counter:
 
    ```go
    byToken[event.TokenSymbol]++
    ```
 
-3. Nos tres pontos onde as metricas sao logadas (canal fechado, ticker, ctx.Done),
-   inclua o mapa de tokens na mensagem:
+3. At the three points where metrics are logged (channel closed, ticker,
+   ctx.Done), include the token map in the message:
 
    ```go
    log.Printf("watcher: [METRICS] incoming=%d outgoing=%d total=%d byToken=%v",
        incoming, outgoing, incoming+outgoing, byToken)
    ```
 
-### Dica
+### Hint
 
-- O `map[string]int` e seguro aqui porque apenas **uma unica goroutine** (o metricsWorker)
-  le e escreve nele. Se multiplas goroutines precisassem acessar o mapa, voce precisaria
-  de um `sync.Mutex` ou `sync.Map`. Esse e um conceito importante: dados confinados a
-  uma unica goroutine nao precisam de sincronizacao.
-- O `%v` no `log.Printf` imprime o mapa no formato `map[USDC:5 USDT:3]`, que e
-  suficiente para observabilidade basica.
+- The `map[string]int` is safe here because only **one goroutine** (the
+  metricsWorker) reads and writes to it. If multiple goroutines needed to
+  touch the map, you'd need a `sync.Mutex` or `sync.Map`. This is an
+  important concept: data confined to a single goroutine needs no
+  synchronization.
+- `%v` in `log.Printf` prints the map in the form `map[USDC:5 USDT:3]`,
+  which is enough for basic observability.
 
-### Validacao
+### Acceptance
 
-- `go build ./...` compila sem erros.
-- Execute o event-watcher e aguarde pelo menos um ciclo do ticker (15 segundos).
-  A mensagem de metricas deve incluir `byToken=map[...]` com os simbolos dos tokens
-  detectados.
-- Verifique que o mapa mostra `USDC`, `USDT`, e `UNKNOWN` conforme os tokens dos
-  eventos recebidos.
+- `go build ./...` compiles cleanly.
+- Run the event-watcher and wait for at least one tick (15 seconds). The
+  metrics message must include `byToken=map[...]` with the symbols of the
+  detected tokens.
+- Verify the map shows `USDC`, `USDT`, and `UNKNOWN` according to the
+  events received.
 
 ---
 
-## Exercicio 4: Rate limiter para o worker pool
+## Exercise 4: Rate limiter for the worker pool
 
-**Dificuldade:** Intermediario
+**Difficulty:** Intermediate
 
-### Conceito
+### Concept
 
-O `RunWorkerPool` em `internal/concurrent/workerpool.go` limita a concorrencia pelo
-numero de goroutines (`numWorkers`), mas nao limita a **taxa** de requests por segundo.
-Por exemplo, com 5 workers, se cada request leva 100ms, voce faz ~50 requests/segundo.
-Mas se cada request leva 10ms, voce faz ~500 requests/segundo — o que pode exceder
-o rate limit de um RPC como Infura ou Alchemy.
+`RunWorkerPool` in `internal/concurrent/workerpool.go` caps concurrency by
+the number of goroutines (`numWorkers`) but does not cap **requests per
+second**. For example, with 5 workers, if each request takes 100ms you
+make ~50 req/s. But if each request takes 10ms, you make ~500 req/s —
+which can exceed an RPC provider's rate limit (Infura, Alchemy, …).
 
-Neste exercicio voce implementara um rate limiter usando `time.Ticker` como semaforo:
-antes de processar cada item, o worker espera um "tick", garantindo um intervalo minimo
-entre requests.
+In this exercise you'll implement a rate limiter using `time.Ticker` as a
+semaphore: before processing an item, the worker waits for a "tick",
+guaranteeing a minimum interval between requests.
 
-### Instrucoes
+### Instructions
 
-1. **`internal/concurrent/workerpool.go`** — Crie uma nova funcao `RunWorkerPoolWithRateLimit`:
+1. **`internal/concurrent/workerpool.go`** — Create a new function
+   `RunWorkerPoolWithRateLimit`:
 
    ```go
    func RunWorkerPoolWithRateLimit[I any, O any](
@@ -258,7 +270,7 @@ entre requests.
            go func(workerID int) {
                defer wg.Done()
                for item := range input {
-                   // Espera pelo tick antes de processar.
+                   // Wait for a tick before processing.
                    select {
                    case <-ticker.C:
                    case <-ctx.Done():
@@ -292,51 +304,54 @@ entre requests.
    }
    ```
 
-2. **`internal/snapshot/runner.go`** — Substitua a chamada a `RunWorkerPool` por
-   `RunWorkerPoolWithRateLimit` com um rate de 5 requests/segundo (ou um valor
-   configuravel via parametro do `Runner`).
+2. **`internal/snapshot/runner.go`** — Replace the `RunWorkerPool` call
+   with `RunWorkerPoolWithRateLimit`, targeting 5 requests/second (or a
+   value configurable through a new `Runner` parameter).
 
-### Dica
+### Hint
 
-- O `time.Ticker` funciona como um "token bucket" simplificado: cada tick libera
-  um token, e os workers competem pelos ticks. Como todos os workers compartilham
-  o mesmo ticker, no maximo `ratePerSecond` requests serao iniciadas por segundo,
-  independente do numero de workers.
-- Atencao: com `ratePerSecond=5` e `numWorkers=5`, cada worker fara em media
-  1 request/segundo. Se `numWorkers > ratePerSecond`, alguns workers ficarao ociosos
-  na maioria dos ciclos — isso e esperado e nao e um problema.
-- Nao esqueca do `ticker.Stop()` na goroutine de cleanup para evitar leak de recursos.
+- `time.Ticker` acts as a simplified "token bucket": each tick releases one
+  token, and the workers race for them. Because every worker shares the
+  same ticker, at most `ratePerSecond` requests start per second regardless
+  of how many workers exist.
+- Heads up: with `ratePerSecond=5` and `numWorkers=5`, each worker averages
+  one request per second. If `numWorkers > ratePerSecond`, some workers
+  will idle most of the time — that's expected and not a problem.
+- Don't forget `ticker.Stop()` in the cleanup goroutine to avoid leaking
+  the timer.
 
-### Validacao
+### Acceptance
 
-- Escreva um teste em `internal/concurrent/workerpool_test.go` que:
-  - Cria um `RunWorkerPoolWithRateLimit` com `ratePerSecond=10` e 3 workers.
-  - Envia 10 items pelo canal de entrada.
-  - Mede o tempo total de processamento e verifica que levou **pelo menos** 900ms
-    (10 items / 10 por segundo = ~1 segundo).
-  - Verifica que todos os 10 resultados foram recebidos no canal de saida.
-- Execute `go test ./internal/concurrent/ -run TestRunWorkerPoolWithRateLimit -v`.
+- Write a test in `internal/concurrent/workerpool_test.go` that:
+  - Creates a `RunWorkerPoolWithRateLimit` with `ratePerSecond=10` and 3
+    workers.
+  - Sends 10 items through the input channel.
+  - Measures the total processing time and verifies it is **at least**
+    900ms (10 items / 10 per second ≈ 1 second).
+  - Verifies that all 10 results were received on the output channel.
+- Run `go test ./internal/concurrent/ -run TestRunWorkerPoolWithRateLimit -v`.
 
 ---
 
-## Exercicio 5: Retry com backoff exponencial no LogsFetcher
+## Exercise 5: Exponential-backoff retry for the LogsFetcher
 
-**Dificuldade:** Intermediario
+**Difficulty:** Intermediate
 
-### Conceito
+### Concept
 
-O `EthereumLogsFetcher` em `internal/provider/blockchain/ethereum_logs.go` faz uma
-unica tentativa de chamada RPC. Se a chamada falhar por um erro transiente (rede
-instavel, RPC temporariamente indisponivel), o watcher simplesmente loga o erro e
-espera o proximo ciclo do ticker — potencialmente perdendo eventos.
+`EthereumLogsFetcher` in `internal/provider/blockchain/ethereum_logs.go`
+makes a single RPC attempt. If that call fails due to a transient error
+(flaky network, temporarily unreachable RPC), the watcher simply logs the
+error and waits for the next tick — potentially losing events.
 
-Neste exercicio voce criara um decorator `RetryLogsFetcher` que envolve qualquer
-`contracts.LogsFetcher` e adiciona retry com backoff exponencial. Isso usa o padrao
-decorator: o wrapper implementa a mesma interface que o inner, adicionando comportamento.
+In this exercise you'll build a `RetryLogsFetcher` decorator that wraps
+any `contracts.LogsFetcher` and adds retry with exponential backoff. This
+uses the decorator pattern: the wrapper implements the same interface as
+the inner, adding behavior.
 
-### Instrucoes
+### Instructions
 
-1. **Crie `internal/provider/blockchain/retry_logs.go`** com o struct:
+1. **Create `internal/provider/blockchain/retry_logs.go`** with the struct:
 
    ```go
    type RetryLogsFetcher struct {
@@ -353,7 +368,7 @@ decorator: o wrapper implementa a mesma interface que o inner, adicionando compo
    }
    ```
 
-2. Implemente `FetchLogs` com retry:
+2. Implement `FetchLogs` with retry:
 
    ```go
    func (f *RetryLogsFetcher) FetchLogs(ctx context.Context, addresses []string, fromBlock uint64) ([]json.RawMessage, uint64, error) {
@@ -382,59 +397,65 @@ decorator: o wrapper implementa a mesma interface que o inner, adicionando compo
    }
    ```
 
-3. **`cmd/event-watcher/main.go`** — Envolva o `logsFetcher` com o retry:
+3. **`cmd/event-watcher/main.go`** — Wrap `logsFetcher` with the retry
+   decorator:
 
    ```go
    logsFetcher := blockchain.NewEthereumLogsFetcher(cfg.EthRPCURL)
    retryFetcher := blockchain.NewRetryLogsFetcher(logsFetcher, 3, 1*time.Second)
-   // Use retryFetcher no lugar de logsFetcher ao criar o Watcher.
+   // Use retryFetcher instead of logsFetcher when building the Watcher.
    ```
 
-### Dica
+### Hint
 
-- O `select` com `time.After` e `ctx.Done()` e essencial: se o contexto for cancelado
-  durante o backoff (ex: SIGTERM), o retry para imediatamente em vez de esperar o delay
-  completo.
-- O backoff exponencial funciona assim: attempt 0 = 1s, attempt 1 = 2s, attempt 2 = 4s.
-  A formula e `baseDelay * 2^attempt`, implementada com bit shift: `1 << uint(attempt)`.
-- Em producao voce adicionaria jitter (variacao aleatoria) para evitar thundering herd.
-  Isso esta fora do escopo deste exercicio, mas adicione um comentario mencionando isso.
+- `select` over `time.After` and `ctx.Done()` is essential: if the context
+  is cancelled during backoff (e.g. SIGTERM), the retry stops immediately
+  instead of waiting out the full delay.
+- Exponential backoff works as: attempt 0 = 1s, attempt 1 = 2s, attempt 2 =
+  4s. The formula is `baseDelay * 2^attempt`, implemented with a bit shift:
+  `1 << uint(attempt)`.
+- In production you'd add jitter (random variance) to avoid a thundering
+  herd. That is out of scope here, but leave a comment mentioning it.
 
-### Validacao
+### Acceptance
 
-- Escreva testes em `internal/provider/blockchain/retry_logs_test.go`:
-  - `TestRetryLogsFetcher_SucceedsFirstAttempt`: inner retorna sucesso, verify 1 chamada.
-  - `TestRetryLogsFetcher_RetriesOnError`: inner falha 2 vezes e depois retorna sucesso.
-    Verifique 3 chamadas no total. Use `baseDelay` de 1ms para o teste ser rapido.
-  - `TestRetryLogsFetcher_ExhaustsRetries`: inner sempre falha. Verifique que o erro
-    final contem `"all 4 attempts failed"`.
-  - `TestRetryLogsFetcher_RespectsContextCancellation`: cancele o contexto antes do
-    segundo retry. Verifique que retorna imediatamente com `context.Canceled`.
-- Use um mock que conta chamadas via campo `calls int` no struct.
+- Write tests in `internal/provider/blockchain/retry_logs_test.go`:
+  - `TestRetryLogsFetcher_SucceedsFirstAttempt`: the inner returns success
+    — verify 1 call.
+  - `TestRetryLogsFetcher_RetriesOnError`: the inner fails twice then
+    succeeds. Verify 3 calls total. Use `baseDelay` of 1ms so the test is
+    quick.
+  - `TestRetryLogsFetcher_ExhaustsRetries`: the inner always fails. Verify
+    the final error contains `"all 4 attempts failed"`.
+  - `TestRetryLogsFetcher_RespectsContextCancellation`: cancel the context
+    before the second retry. Verify the call returns immediately with
+    `context.Canceled`.
+- Use a mock that counts calls via a `calls int` field on the struct.
 
 ---
 
-## Exercicio 6: Teste de integracao do pipeline do watcher
+## Exercise 6: Integration test for the watcher pipeline
 
-**Dificuldade:** Intermediario
+**Difficulty:** Intermediate
 
-### Conceito
+### Concept
 
-O watcher tem um pipeline de 3 stages: poller -> normalizer -> fan-out -> consumers.
-Testar cada stage isoladamente e importante, mas um teste de integracao que verifica
-o fluxo completo garante que os canais estao conectados corretamente e que o close
-se propaga pela pipeline inteira.
+The watcher has a 3-stage pipeline: poller → normalizer → fan-out →
+consumers. Testing each stage in isolation matters, but an integration
+test that drives the full flow guarantees that the channels are correctly
+wired together and that `close` propagates through the entire pipeline.
 
-Neste exercicio voce montara o pipeline com mocks e verificara que um log raw
-inserido no inicio chega ate o consumer final como um `WalletEvent` normalizado.
+In this exercise you'll assemble the pipeline with mocks and verify that a
+raw log inserted at the start reaches the final consumer as a normalized
+`WalletEvent`.
 
-### Instrucoes
+### Instructions
 
-1. **Crie `internal/watcher/watcher_integration_test.go`** com o teste
+1. **Create `internal/watcher/watcher_integration_test.go`** with the test
    `TestWatcherPipeline_EndToEnd`.
 
-2. Crie um mock `mockLogsFetcher` que retorna uma lista fixa de logs raw no formato
-   JSON. Use o formato do `RawLog`:
+2. Build a `mockLogsFetcher` that returns a fixed list of raw JSON logs.
+   Use the `RawLog` shape:
 
    ```go
    rawLog := watcher.RawLog{
@@ -451,7 +472,7 @@ inserido no inicio chega ate o consumer final como um `WalletEvent` normalizado.
    }
    ```
 
-3. Monte o pipeline manualmente (sem usar `Watcher.Run`):
+3. Assemble the pipeline manually (without going through `Watcher.Run`):
 
    ```go
    ctx, cancel := context.WithCancel(context.Background())
@@ -461,10 +482,10 @@ inserido no inicio chega ate o consumer final como um `WalletEvent` normalizado.
        "0x2222222222222222222222222222222222222222": "wallet-1",
    }
 
-   // Stage 1: gere os raw logs no canal
+   // Stage 1: generate raw logs on the channel.
    rawCh := concurrent.Generate(ctx, rawLogs)
 
-   // Stage 2: normalize
+   // Stage 2: normalize.
    normalized := concurrent.Stage(ctx, rawCh, func(_ context.Context, raw watcher.RawLog) (*domain.WalletEvent, bool) {
        event, err := watcher.NormalizeTransferLog(raw, trackedAddresses)
        if err != nil || event == nil {
@@ -473,68 +494,70 @@ inserido no inicio chega ate o consumer final como um `WalletEvent` normalizado.
        return event, true
    })
 
-   // Stage 3: fan-out para 1 consumer (simplificado para o teste)
+   // Stage 3: fan-out to 1 consumer (simplified for the test).
    consumers := concurrent.FanOut(ctx, normalized, 1)
 
-   // Colete os resultados
+   // Collect results.
    var received []*domain.WalletEvent
    for event := range consumers[0] {
        received = append(received, event)
    }
    ```
 
-4. Verifique que o evento recebido tem os campos corretos: `WalletID == "wallet-1"`,
-   `Direction == "incoming"`, `TokenSymbol == "USDC"`, `TxHash == "0xabc123"`.
+4. Verify the received event carries the correct fields: `WalletID ==
+   "wallet-1"`, `Direction == "incoming"`, `TokenSymbol == "USDC"`,
+   `TxHash == "0xabc123"`.
 
-### Dica
+### Hint
 
-- O ponto-chave deste teste e verificar a **propagacao de close**: quando `Generate`
-  fecha o canal de entrada, o `Stage` processa os items restantes e fecha seu canal
-  de saida, que por sua vez faz o `FanOut` fechar os canais dos consumers. O `range`
-  no consumer termina naturalmente.
-- Se o teste travar (deadlock), e provavel que algum canal nao esteja sendo fechado
-  corretamente. Adicione um `context.WithTimeout` como safety net:
+- The key point of this test is proving **close propagation**: when
+  `Generate` closes the input channel, `Stage` finishes the remaining
+  items and closes its output, which then makes `FanOut` close its
+  downstream channels. The consumer's `range` ends naturally.
+- If the test hangs (deadlock), some channel is likely not being closed
+  correctly. Add a `context.WithTimeout` as a safety net:
   ```go
   ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
   ```
-- Voce nao precisa de um mock do `EventRepository` porque o teste nao chama `persistWorker`.
+- You don't need an `EventRepository` mock because the test does not hit
+  `persistWorker`.
 
-### Validacao
+### Acceptance
 
-- `go test ./internal/watcher/ -run TestWatcherPipeline_EndToEnd -v` passa.
-- O teste termina em menos de 1 segundo (nao ha polling envolvido).
-- Adicione um segundo raw log com `Removed: true` e verifique que ele e filtrado
-  pelo normalizer (nao aparece em `received`).
+- `go test ./internal/watcher/ -run TestWatcherPipeline_EndToEnd -v` passes.
+- The test completes in under 1 second (no polling involved).
+- Add a second raw log with `Removed: true` and verify it is filtered out
+  by the normalizer (it must not appear in `received`).
 
 ---
 
-## Exercicio 7: Stage de deduplicacao no watcher
+## Exercise 7: Deduplication stage in the watcher
 
-**Dificuldade:** Intermediario
+**Difficulty:** Intermediate
 
-### Conceito
+### Concept
 
-Em blockchains, e possivel receber o mesmo evento mais de uma vez — por exemplo,
-quando o poller consulta blocos que se sobrepoe ao intervalo anterior, ou durante
-uma reorganizacao de cadeia. Neste exercicio voce adicionara um stage de pipeline
-que filtra eventos duplicados baseado no `TxHash`.
+On blockchains it's possible to receive the same event more than once —
+for example, when the poller queries blocks that overlap the previous
+window, or during a chain reorganization. In this exercise you'll add a
+pipeline stage that filters duplicate events based on `TxHash`.
 
-O `concurrent.Stage` suporta filtragem nativamente: quando a funcao de transformacao
-retorna `(_, false)`, o item e descartado. Voce usara um `map[string]bool` para
-rastrear quais `TxHash` ja foram vistos.
+`concurrent.Stage` supports filtering natively: when the transform function
+returns `(_, false)`, the item is dropped. You'll use a `map[string]bool`
+to track which `TxHash` values have already been seen.
 
-### Instrucoes
+### Instructions
 
-1. **`internal/watcher/watcher.go`** — No metodo `Run`, adicione um stage de
-   deduplicacao entre o normalizer e o fan-out:
+1. **`internal/watcher/watcher.go`** — In `Run`, add a deduplication stage
+   between the normalizer and the fan-out:
 
    ```go
    // Stage 2: Normalizer
    normalized := concurrent.Stage(ctx, rawLogs, func(_ context.Context, raw RawLog) (*domain.WalletEvent, bool) {
-       // ... (codigo existente) ...
+       // ... existing code ...
    })
 
-   // Stage 2.5: Deduplication (NOVO)
+   // Stage 2.5: Deduplication (NEW)
    seen := make(map[string]bool)
    deduplicated := concurrent.Stage(ctx, normalized, func(_ context.Context, event *domain.WalletEvent) (*domain.WalletEvent, bool) {
        if seen[event.TxHash] {
@@ -545,153 +568,163 @@ rastrear quais `TxHash` ja foram vistos.
        return event, true
    })
 
-   // Stage 3: Fan-Out (agora lê de deduplicated)
+   // Stage 3: Fan-Out (now reading from deduplicated)
    consumers := concurrent.FanOut(ctx, deduplicated, 3)
    ```
 
-2. Atualize o diagrama ASCII no comentario do `Run` para incluir o novo stage.
+2. Update the ASCII diagram in the `Run` doc comment to include the new
+   stage.
 
-### Dica
+### Hint
 
-- O `map[string]bool` e seguro sem `sync.Mutex` porque o `Stage` executa a funcao
-  de transformacao em uma **unica goroutine**. Olhe a implementacao de `Stage` em
-  `internal/concurrent/pipeline.go`: ha apenas um `go func()` que processa items
-  sequencialmente. Se houvesse multiplas goroutines, voce precisaria de sincronizacao.
-- Em producao, o mapa `seen` cresceria indefinidamente. Um exercicio bonus seria
-  limitar o tamanho do mapa (ex: manter apenas os ultimos 10.000 hashes) ou usar
-  um TTL. Por ora, o mapa simples e suficiente.
-- A closure captura `seen` por referencia, entao o mapa persiste entre chamadas
-  da funcao de transformacao.
+- The `map[string]bool` is safe without a `sync.Mutex` because `Stage`
+  runs the transform in a **single goroutine**. Look at the implementation
+  of `Stage` in `internal/concurrent/pipeline.go`: there is exactly one
+  `go func()` processing items sequentially. If there were multiple
+  goroutines, you'd need synchronization.
+- In production, the `seen` map would grow without bound. A bonus exercise
+  would be to cap the map (e.g. keep the most recent 10,000 hashes) or use
+  a TTL. For now, the plain map is enough.
+- The closure captures `seen` by reference, so the map persists between
+  calls to the transform function.
 
-### Validacao
+### Acceptance
 
-- Escreva um teste em `internal/watcher/watcher_test.go` (ou o integration test
-  do Exercicio 6) que envia 3 raw logs pelo pipeline, dois dos quais tem o mesmo
-  `TxHash`. Verifique que apenas 2 eventos saem do stage de deduplicacao.
-- Verifique no log que a mensagem `"duplicate tx=... — skipping"` aparece para
-  o evento duplicado.
-- `go test ./internal/watcher/ -v` passa.
+- Write a test in `internal/watcher/watcher_test.go` (or in the
+  integration test from Exercise 6) that sends 3 raw logs through the
+  pipeline, two of which share the same `TxHash`. Verify that only 2
+  events leave the deduplication stage.
+- Verify the log contains `"duplicate tx=... — skipping"` for the
+  duplicate event.
+- `go test ./internal/watcher/ -v` passes.
 
 ---
 
-## Exercicio 8: Worker pool dinamico baseado em queue depth
+## Exercise 8: Dynamic worker pool based on queue depth
 
-**Dificuldade:** Avancado
+**Difficulty:** Advanced
 
-### Conceito
+### Concept
 
-O `RunWorkerPool` usa um numero fixo de workers. Isso e simples, mas nao se adapta
-a carga variavel. Neste exercicio voce implementara um worker pool que ajusta o
-numero de goroutines dinamicamente:
+`RunWorkerPool` uses a fixed worker count. That's simple, but it doesn't
+adapt to variable load. In this exercise you'll implement a worker pool
+that tunes the goroutine count dynamically:
 
-- Se o canal de entrada esta > 80% cheio, adiciona um worker (escalar para cima).
-- Se o canal de entrada esta < 20% cheio, remove um worker (escalar para baixo).
-- Respeita limites minimo (1) e maximo (configuravel).
+- If the input channel is > 80% full, add a worker (scale up).
+- If the input channel is < 20% full, remove a worker (scale down).
+- Respect a minimum (1) and a configurable maximum.
 
-Isso ensina como gerenciar o ciclo de vida de goroutines dinamicamente usando
-`context.CancelFunc` individual por worker e um monitor separado.
+This teaches how to manage goroutine lifecycles dynamically using a
+per-worker `context.CancelFunc` and a separate monitor goroutine.
 
-### Instrucoes
+### Instructions
 
-1. **Crie `internal/concurrent/dynamic_pool.go`** com:
+1. **Create `internal/concurrent/dynamic_pool.go`** with:
 
    ```go
    func RunDynamicWorkerPool[I any, O any](
        ctx context.Context,
        minWorkers, maxWorkers int,
-       input chan I,  // NOTA: chan I (bidirecional) — precisamos de len() e cap()
+       input chan I,  // NOTE: chan I (bidirectional) — we need len() and cap()
        process func(context.Context, I) O,
    ) <-chan O
    ```
 
-2. A estrategia interna:
-   - Mantenha uma lista de `cancelFunc` por worker ativo.
-   - Uma goroutine "monitor" verifica `len(input)` e `cap(input)` a cada 500ms.
-   - Se `len(input) > cap(input)*80/100` e workers atuais < maxWorkers: inicie um novo
-     worker com seu proprio `context.WithCancel`.
-   - Se `len(input) < cap(input)*20/100` e workers atuais > minWorkers: cancele o
-     context do ultimo worker adicionado.
-   - Use `sync.WaitGroup` para esperar todos os workers antes de fechar o output.
+2. Internal strategy:
+   - Maintain a list of `cancelFunc` values, one per active worker.
+   - A "monitor" goroutine inspects `len(input)` and `cap(input)` every
+     500ms.
+   - If `len(input) > cap(input)*80/100` and workers < maxWorkers: start
+     a new worker with its own `context.WithCancel`.
+   - If `len(input) < cap(input)*20/100` and workers > minWorkers: cancel
+     the context of the most recently added worker.
+   - Use `sync.WaitGroup` to wait for all workers before closing the
+     output channel.
 
-3. **Importante**: cada worker deve respeitar **seu proprio** context de cancelamento
-   (para scale-down), mas tambem o context pai (para shutdown geral).
+3. **Important**: each worker must respect **its own** cancellation
+   context (for scale-down) and the parent context (for global shutdown).
 
-### Dica
+### Hint
 
-- O parametro `input` precisa ser `chan I` (bidirecional) em vez de `<-chan I` porque
-  `len()` e `cap()` so funcionam em canais bidirecionais ou com a direcao correta.
-  Na pratica, `len()` e `cap()` funcionam em `<-chan` tambem, mas o tipo bidirecional
-  deixa a intencao mais clara.
-- Para cancelar um worker especifico sem afetar os outros, use um context derivado
-  por worker: `workerCtx, workerCancel := context.WithCancel(ctx)`. Quando voce
-  chama `workerCancel()`, apenas aquele worker para.
-- Cuidado com race conditions ao acessar a lista de workers. Use um `sync.Mutex`
-  para proteger o slice de cancel functions.
-- Um worker que tem seu context cancelado deve sair do loop `for item := range input`
-  graciosamente via `select` com `workerCtx.Done()`.
+- The `input` parameter needs to be `chan I` (bidirectional) rather than
+  `<-chan I` because `len()` and `cap()` work more cleanly on bidirectional
+  channels. In practice they work on `<-chan` too, but the bidirectional
+  type makes the intent clearer.
+- To cancel a single worker without affecting the others, derive a per-
+  worker context: `workerCtx, workerCancel := context.WithCancel(ctx)`.
+  Calling `workerCancel()` stops just that worker.
+- Beware of races when accessing the list of workers. Use a `sync.Mutex`
+  to protect the slice of cancel functions.
+- A worker whose context was cancelled must exit the `for item := range
+  input` loop gracefully via `select` with `workerCtx.Done()`.
 
-### Validacao
+### Acceptance
 
-- Escreva um teste em `internal/concurrent/dynamic_pool_test.go` que:
-  - Cria um canal de entrada com buffer 100.
-  - Envia 90 items de uma vez (> 80% do buffer).
-  - Verifica que workers adicionais sao criados (logue o numero atual de workers).
-  - Apos processar todos os items, verifica que workers sao removidos.
-  - Verifica que todos os 90 resultados sao recebidos no canal de saida.
-- Use `process` functions com `time.Sleep(10 * time.Millisecond)` para simular trabalho.
-- `go test ./internal/concurrent/ -run TestRunDynamicWorkerPool -v -race` passa
-  (o flag `-race` detecta race conditions).
+- Write a test in `internal/concurrent/dynamic_pool_test.go` that:
+  - Creates an input channel with buffer 100.
+  - Sends 90 items at once (> 80% of the buffer).
+  - Verifies that extra workers are created (log the current worker count).
+  - After all items are processed, verifies that workers are removed.
+  - Verifies all 90 results are received on the output channel.
+- Use `process` functions with `time.Sleep(10 * time.Millisecond)` to
+  simulate work.
+- `go test ./internal/concurrent/ -run TestRunDynamicWorkerPool -v -race`
+  passes (the `-race` flag exposes race conditions).
 
 ---
 
-## Exercicio 9: Substituir polling por WebSocket
+## Exercise 9: Replace polling with WebSockets
 
-**Dificuldade:** Avancado
+**Difficulty:** Advanced
 
-### Conceito
+### Concept
 
-O watcher atual usa polling HTTP (`eth_getLogs` a cada N segundos). Isso tem latencia
-inerente: eventos so sao detectados no proximo ciclo de polling. Uma alternativa e usar
-WebSocket com `eth_subscribe("logs", ...)`, que envia eventos em tempo real assim que
-o nodo Ethereum os processa.
+The current watcher uses HTTP polling (`eth_getLogs` every N seconds). That
+has inherent latency: events are only detected on the next poll. An
+alternative is WebSockets with `eth_subscribe("logs", ...)`, which pushes
+events in real time as soon as the Ethereum node emits them.
 
-Neste exercicio voce criara uma implementacao alternativa do poller que usa WebSocket,
-mas mantem o **mesmo pipeline downstream** (normalizer -> fan-out -> consumers).
-Isso demonstra o poder de channels como abstração: o poller produz `RawLog` em um
-canal, e o resto do pipeline nao sabe (nem se importa) se os dados vieram via HTTP
-ou WebSocket.
+In this exercise you'll build an alternative poller that uses WebSockets
+but keeps the **same downstream pipeline** (normalizer → fan-out →
+consumers). This demonstrates the power of channels as an abstraction: the
+poller produces `RawLog` values on a channel, and the rest of the pipeline
+has no idea (and doesn't care) whether the data arrived over HTTP or over
+WebSockets.
 
-### Instrucoes
+### Instructions
 
-1. Adicione a dependencia:
+1. Add the dependency:
 
    ```bash
    go get github.com/gorilla/websocket
    ```
 
-2. **Crie `internal/provider/blockchain/ethereum_ws.go`** com um struct `EthereumWSLogsFetcher`
-   que implementa uma funcao `Subscribe`:
+2. **Create `internal/provider/blockchain/ethereum_ws.go`** with a struct
+   `EthereumWSLogsFetcher` exposing a `Subscribe` function:
 
    ```go
    func (f *EthereumWSLogsFetcher) Subscribe(ctx context.Context, addresses []string) (<-chan RawLog, error)
    ```
 
-   A funcao deve:
-   - Conectar ao endpoint WebSocket com `websocket.DefaultDialer.DialContext`.
-   - Enviar uma mensagem `eth_subscribe` com filtro de logs para os enderecos.
-   - Iniciar uma goroutine que le mensagens do WebSocket e envia `RawLog` no canal.
-   - Fechar o canal e a conexao quando o context e cancelado.
+   The function must:
+   - Connect to the WebSocket endpoint with
+     `websocket.DefaultDialer.DialContext`.
+   - Send an `eth_subscribe` message with a logs filter for the addresses.
+   - Start a goroutine that reads messages from the socket and forwards
+     `RawLog` values into the channel.
+   - Close the channel and the socket when the context is cancelled.
 
-3. **`internal/watcher/watcher.go`** — Crie um metodo alternativo `startWSPoller` que
-   retorna `<-chan RawLog` (mesmo tipo que `startPoller`). O restante do pipeline
-   (`Stage`, `FanOut`, consumers) permanece identico.
+3. **`internal/watcher/watcher.go`** — Add an alternative method
+   `startWSPoller` that returns `<-chan RawLog` (same type as
+   `startPoller`). The rest of the pipeline (`Stage`, `FanOut`, consumers)
+   stays identical.
 
-4. Adicione uma flag ou variavel de ambiente `WATCHER_MODE=ws|poll` para escolher
-   entre os dois modos.
+4. Add a flag or environment variable `WATCHER_MODE=ws|poll` to choose
+   between the two modes.
 
-### Dica
+### Hint
 
-- A assinatura `eth_subscribe` para logs e:
+- The `eth_subscribe` request for logs looks like:
   ```json
   {
     "jsonrpc": "2.0",
@@ -700,54 +733,60 @@ ou WebSocket.
     "id": 1
   }
   ```
-  O nodo responde com um `subscription_id`, e a partir dai envia notificacoes no
-  formato `{"method": "eth_subscription", "params": {"subscription": "0x...", "result": {...}}}`.
-- O ponto-chave da arquitetura: tanto `startPoller` quanto `startWSPoller` retornam
-  `<-chan RawLog`. O pipeline downstream e identico porque consome do canal sem saber
-  a origem dos dados. **Channels como interface** — essa e a abstracao.
-- Em testes, use um servidor WebSocket mock com `httptest.NewServer` e `websocket.Upgrader`.
-- Endpoints como Infura e Alchemy suportam WebSocket em URLs `wss://`.
+  The node responds with a `subscription_id`, and from then on pushes
+  notifications shaped as
+  `{"method": "eth_subscription", "params": {"subscription": "0x...", "result": {...}}}`.
+- The architectural key point: both `startPoller` and `startWSPoller`
+  return `<-chan RawLog`. The downstream pipeline is identical because it
+  consumes from the channel without caring about the source. **Channels
+  as interface** — that's the abstraction.
+- In tests, use a mock WebSocket server with `httptest.NewServer` and
+  `websocket.Upgrader`.
+- Providers like Infura and Alchemy expose WebSockets at `wss://` URLs.
 
-### Validacao
+### Acceptance
 
-- `go build ./...` compila.
-- Com um endpoint WebSocket real (ex: `wss://mainnet.infura.io/ws/v3/YOUR_KEY`),
-  execute `go run ./cmd/event-watcher` com `WATCHER_MODE=ws` e verifique que eventos
-  chegam em tempo real (sem o delay do polling).
-- Verifique que o modo `poll` continua funcionando normalmente.
-- Escreva um teste unitario com um WebSocket mock que envia 3 eventos e verifica
-  que todos chegam no canal retornado por `Subscribe`.
+- `go build ./...` compiles.
+- With a real WebSocket endpoint (e.g.
+  `wss://mainnet.infura.io/ws/v3/YOUR_KEY`), run `go run
+  ./cmd/event-watcher` with `WATCHER_MODE=ws` and verify that events
+  arrive in real time (without the polling delay).
+- Verify that `poll` mode still works.
+- Write a unit test with a mock WebSocket server that sends 3 events and
+  verifies they all arrive on the channel returned by `Subscribe`.
 
 ---
 
-## Exercicio 10: Timeout por wallet no snapshot runner
+## Exercise 10: Per-wallet timeout in the snapshot runner
 
-**Dificuldade:** Avancado
+**Difficulty:** Advanced
 
-### Conceito
+### Concept
 
-Atualmente o `processWallet` em `internal/snapshot/runner.go` nao tem timeout
-individual — se uma chamada RPC travar, a goroutine do worker fica bloqueada
-indefinidamente (ate o timeout global do context pai, se houver).
+Currently, `processWallet` in `internal/snapshot/runner.go` has no
+per-wallet timeout — if an RPC call hangs, the worker's goroutine stays
+blocked indefinitely (until the parent context's global timeout fires, if
+any).
 
-Neste exercicio voce adicionara um timeout por wallet usando `context.WithTimeout`,
-permitindo que o pipeline continue processando outras wallets mesmo quando uma
-individual e lenta. Isso demonstra o padrao de **partial failure** com goroutines:
-falhas individuais nao devem parar o processamento em lote.
+In this exercise you'll add a per-wallet timeout using
+`context.WithTimeout`, allowing the pipeline to keep processing other
+wallets even when a single one is slow. This illustrates the **partial
+failure** pattern with goroutines: individual failures must not stop the
+batch.
 
-### Instrucoes
+### Instructions
 
-1. **`internal/snapshot/runner.go`** — Adicione um campo `walletTimeout` ao struct
-   `Runner`:
+1. **`internal/snapshot/runner.go`** — Add a `walletTimeout` field to the
+   `Runner` struct:
 
    ```go
    type Runner struct {
-       // ... campos existentes ...
+       // ... existing fields ...
        walletTimeout time.Duration
    }
    ```
 
-2. No construtor `NewRunner`, defina um default:
+2. In `NewRunner`, set a default:
 
    ```go
    if walletTimeout <= 0 {
@@ -755,8 +794,8 @@ falhas individuais nao devem parar o processamento em lote.
    }
    ```
 
-3. No metodo `Run`, altere a funcao passada ao `RunWorkerPool` para usar um context
-   com timeout:
+3. In `Run`, wrap the function passed to `RunWorkerPool` with a
+   timeout-bounded context:
 
    ```go
    resultCh := concurrent.RunWorkerPool(ctx, r.numWorkers, walletCh, func(ctx context.Context, wallet domain.Wallet) walletResult {
@@ -766,65 +805,73 @@ falhas individuais nao devem parar o processamento em lote.
    })
    ```
 
-4. No `processWallet`, verifique o contexto antes de cada chamada RPC:
+4. In `processWallet`, check the context before each RPC call:
 
    ```go
    if ctx.Err() != nil {
        return walletResult{
            WalletID: wallet.ID,
-           Items:    items, // retorna items parciais ja coletados
+           Items:    items, // return the partial items already collected
            Error:    fmt.Errorf("wallet timeout: %w", ctx.Err()),
        }
    }
    ```
 
-### Dica
+### Hint
 
-- O `context.WithTimeout` cria um context derivado que e cancelado automaticamente
-  apos a duracao especificada. Quando `walletCtx` expira, todas as chamadas HTTP feitas
-  com ele retornam imediatamente com `context.DeadlineExceeded`.
-- O `defer cancel()` e obrigatorio. Mesmo que o timeout expire sozinho, voce deve
-  chamar `cancel()` para liberar os recursos associados ao timer. O linter `go vet`
-  avisa se voce esquecer.
-- Observe o padrao de partial failure: se `GetBalance` do ETH foi bem-sucedido mas
-  `GetTokenBalance` do USDC excedeu o timeout, o resultado contem o item ETH (parcial)
-  mais o erro. O stage 4 (agregacao) decide como lidar com isso — no caso atual,
-  items parciais sao incluidos no snapshot.
-- Nao confunda o timeout por wallet com o timeout global em `cmd/snapshot-runner/main.go`
-  (`context.WithTimeout(context.Background(), 5*time.Minute)`). Sao contextos aninhados:
-  wallet timeout (10s) < global timeout (5min).
+- `context.WithTimeout` creates a derived context that cancels
+  automatically after the specified duration. When `walletCtx` expires,
+  every HTTP call made with it returns immediately with
+  `context.DeadlineExceeded`.
+- `defer cancel()` is required. Even if the timeout fires on its own, you
+  still have to call `cancel()` to release timer resources. `go vet` will
+  warn if you forget.
+- Notice the partial-failure shape: if `GetBalance` for ETH succeeded but
+  `GetTokenBalance` for USDC exceeded the deadline, the result contains
+  the ETH item (partial) plus the error. Stage 4 (aggregation) decides
+  how to handle that — in the current design, partial items are included
+  in the snapshot.
+- Don't confuse the per-wallet timeout with the global timeout in
+  `cmd/snapshot-runner/main.go`
+  (`context.WithTimeout(context.Background(), 5*time.Minute)`). They are
+  nested contexts: wallet timeout (10s) < global timeout (5min).
 
-### Validacao
+### Acceptance
 
-- Escreva um teste em `internal/snapshot/runner_test.go` que:
-  - Usa um mock `BalanceProvider` que bloqueia com `time.Sleep(20 * time.Second)`.
-  - Configura `walletTimeout = 100 * time.Millisecond`.
-  - Verifica que o `Run` completa em menos de 1 segundo (nao espera os 20s).
-  - Verifica que o resultado contem um erro com `"deadline exceeded"`.
-  - Verifica que o snapshot tem status `"completed"` (ou `"failed"` se nenhum wallet
-    retornou dados).
-- `go test ./internal/snapshot/ -run TestRunnerWalletTimeout -v -timeout 10s` passa.
+- Write a test in `internal/snapshot/runner_test.go` that:
+  - Uses a mock `BalanceProvider` that blocks on
+    `time.Sleep(20 * time.Second)`.
+  - Sets `walletTimeout = 100 * time.Millisecond`.
+  - Verifies that `Run` completes in under 1 second (it must not wait the
+    full 20s).
+  - Verifies the result contains an error matching `"deadline exceeded"`.
+  - Verifies the snapshot has status `"completed"` (or `"failed"` if no
+    wallet returned data).
+- `go test ./internal/snapshot/ -run TestRunnerWalletTimeout -v -timeout 10s`
+  passes.
 
 ---
 
-## Exercicio 11: Benchmark comparando tamanhos de worker pool
+## Exercise 11: Benchmark different worker pool sizes
 
-**Dificuldade:** Avancado
+**Difficulty:** Advanced
 
-### Conceito
+### Concept
 
-Quantos workers sao ideais? A resposta depende do tipo de trabalho (CPU-bound vs I/O-bound),
-da latencia das chamadas externas, e do rate limit do provider. Neste exercicio voce
-criara benchmarks parametrizados para medir o throughput do snapshot runner com
-diferentes tamanhos de pool.
+How many workers is ideal? The answer depends on the kind of work
+(CPU-bound vs I/O-bound), the latency of external calls, and the
+provider's rate limit. In this exercise you'll build parametrized
+benchmarks that measure snapshot-runner throughput at different pool
+sizes.
 
-Go tem suporte nativo a benchmarks com `testing.B`. Benchmarks sao funcoes que comecam
-com `Benchmark` em vez de `Test`, e o framework executa a funcao `b.N` vezes para
-obter uma medida estavel.
+Go has native benchmark support via `testing.B`. Benchmarks are functions
+whose name starts with `Benchmark` instead of `Test`; the framework runs
+the body `b.N` times to get a stable measurement.
 
-### Instrucoes
+### Instructions
 
-1. **Crie `internal/snapshot/runner_bench_test.go`** com benchmarks parametrizados:
+1. **Create `internal/snapshot/runner_bench_test.go`** with parametrized
+   benchmarks:
 
    ```go
    func BenchmarkSnapshotRunner(b *testing.B) {
@@ -832,9 +879,9 @@ obter uma medida estavel.
 
        for _, numWorkers := range workerCounts {
            b.Run(fmt.Sprintf("workers-%d", numWorkers), func(b *testing.B) {
-               // Setup: crie mocks que simulam latencia de rede
-               // com time.Sleep(10 * time.Millisecond).
-               // Crie um runner com numWorkers.
+               // Setup: build mocks that simulate network latency
+               // with time.Sleep(10 * time.Millisecond).
+               // Create a runner with numWorkers.
 
                b.ResetTimer()
                for i := 0; i < b.N; i++ {
@@ -848,81 +895,86 @@ obter uma medida estavel.
    }
    ```
 
-2. Os mocks devem:
-   - `WalletRepository.FindByBlockchain`: retornar 20 wallets fixas.
-   - `BalanceProvider.GetBalance`: `time.Sleep(10ms)` + retornar um valor fixo.
-   - `TokenBalanceProvider.GetTokenBalance`: `time.Sleep(10ms)` + retornar um valor fixo.
-   - `PriceProvider.GetPriceUSD`: retornar um valor fixo sem delay.
-   - `SnapshotRepository`: operacoes no-op (nao persistir).
+2. The mocks should:
+   - `WalletRepository.FindByBlockchain`: return 20 fixed wallets.
+   - `BalanceProvider.GetBalance`: `time.Sleep(10ms)` + return a fixed value.
+   - `TokenBalanceProvider.GetTokenBalance`: `time.Sleep(10ms)` + return a
+     fixed value.
+   - `PriceProvider.GetPriceUSD`: return a fixed value with no delay.
+   - `SnapshotRepository`: no-op operations (don't persist).
 
-3. Execute os benchmarks e analise os resultados.
+3. Run the benchmarks and analyze the results.
 
-### Dica
+### Hint
 
-- Execute com: `go test ./internal/snapshot/ -bench=BenchmarkSnapshotRunner -benchtime=5s -v`.
-- O output tera o formato:
+- Run with
+  `go test ./internal/snapshot/ -bench=BenchmarkSnapshotRunner -benchtime=5s -v`.
+- The output looks like:
   ```
   BenchmarkSnapshotRunner/workers-1    N    xxxxx ns/op
   BenchmarkSnapshotRunner/workers-2    N    xxxxx ns/op
   BenchmarkSnapshotRunner/workers-4    N    xxxxx ns/op
   ...
   ```
-- Com 20 wallets e 10ms por chamada RPC (ETH + 2 tokens = 3 chamadas por wallet):
-  - 1 worker: ~20 * 30ms = 600ms
-  - 4 workers: ~5 * 30ms = 150ms
-  - 20 workers: ~1 * 30ms = 30ms
-  Mas na pratica ha overhead de scheduling e channel contention, entao os numeros
-  reais serao diferentes.
-- Use `b.ResetTimer()` apos o setup para excluir o tempo de inicializacao.
-- Use `benchstat` para comparar resultados entre execucoes:
+- With 20 wallets and 10ms per RPC call (ETH + 2 tokens = 3 calls per
+  wallet):
+  - 1 worker: ~20 × 30ms = 600ms
+  - 4 workers: ~5 × 30ms = 150ms
+  - 20 workers: ~1 × 30ms = 30ms
+  In practice there is scheduling overhead and channel contention, so
+  real numbers will differ.
+- Use `b.ResetTimer()` after setup to exclude initialization.
+- Use `benchstat` to compare runs statistically:
   ```bash
   go install golang.org/x/perf/cmd/benchstat@latest
   go test -bench=. -count=5 > old.txt
-  # ... faca mudancas ...
+  # ... make changes ...
   go test -bench=. -count=5 > new.txt
   benchstat old.txt new.txt
   ```
 
-### Validacao
+### Acceptance
 
-- Os benchmarks executam sem erros.
-- Os resultados mostram que mais workers reduz o tempo (ate certo ponto).
-- Identifique o ponto de retorno decrescente: a partir de quantos workers o ganho
-  se torna insignificante?
-- Documente suas descobertas em um comentario no topo do arquivo de benchmark.
+- The benchmarks run without errors.
+- The results show that more workers reduce the runtime (up to a point).
+- Identify the point of diminishing returns: beyond how many workers does
+  the gain become negligible?
+- Document your findings in a comment at the top of the benchmark file.
 
 ---
 
-## Exercicio 12: Modo "diff" no snapshot runner (Desafio)
+## Exercise 12: "diff" mode for the snapshot runner (Challenge)
 
-**Dificuldade:** Avancado
+**Difficulty:** Advanced
 
-### Conceito
+### Concept
 
-Atualmente cada execucao do snapshot gera um registro completo e independente. Mas
-para relatorios fiscais, o que interessa sao as **mudancas**: quais wallets tiveram
-alteracoes de saldo entre dois snapshots? Neste exercicio voce implementara um modo
-"diff" que compara o snapshot recem-gerado com o anterior e reporta as diferencas.
+Today each snapshot run produces a complete, independent record. But for
+tax reports, what matters are the **changes**: which wallets had balance
+deltas between two snapshots? In this exercise you'll implement a "diff"
+mode that compares the freshly generated snapshot against the previous
+one and reports the differences.
 
-Isso combina multiplos conceitos de concorrencia:
-- Pipeline para gerar o novo snapshot (existente).
-- Query do snapshot anterior (I/O).
-- Comparacao em memoria (CPU).
-- Output das diferencas via channel para flexibilidade.
+This combines several concurrency concepts:
+- Pipeline to generate the new snapshot (already existing).
+- Query for the previous snapshot (I/O).
+- In-memory comparison (CPU).
+- Output the diffs on a channel for flexibility.
 
-### Instrucoes
+### Instructions
 
-1. **`internal/contracts/contracts.go`** — Adicione um metodo ao `SnapshotRepository`:
+1. **`internal/contracts/contracts.go`** — Add methods to the
+   `SnapshotRepository` interface:
 
    ```go
    type SnapshotRepository interface {
-       // ... metodos existentes ...
+       // ... existing methods ...
        FindLatestCompleted(ctx context.Context) (*domain.WalletSnapshot, error)
        FindSnapshotItems(ctx context.Context, snapshotID string) ([]domain.WalletSnapshotItem, error)
    }
    ```
 
-2. **`internal/domain/snapshot.go`** — Adicione um tipo para representar diferencas:
+2. **`internal/domain/snapshot.go`** — Add a type representing a diff:
 
    ```go
    type SnapshotDiff struct {
@@ -935,77 +987,410 @@ Isso combina multiplos conceitos de concorrencia:
    }
    ```
 
-3. **`internal/snapshot/runner.go`** — Adicione um metodo `RunWithDiff`:
+3. **`internal/snapshot/runner.go`** — Add a `RunWithDiff` method:
 
    ```go
    func (r *Runner) RunWithDiff(ctx context.Context) (*domain.WalletSnapshot, []domain.SnapshotDiff, error) {
-       // 1. Busque o snapshot anterior (FindLatestCompleted).
-       // 2. Execute o pipeline normal (r.Run).
-       // 3. Compare os items do novo snapshot com os do anterior.
-       // 4. Retorne o novo snapshot e a lista de diffs.
+       // 1. Fetch the previous snapshot (FindLatestCompleted).
+       // 2. Run the normal pipeline (r.Run).
+       // 3. Compare the new items against the previous ones.
+       // 4. Return the new snapshot and the list of diffs.
    }
    ```
 
-4. A comparacao deve:
-   - Criar um mapa `chave → WalletSnapshotItem` para o snapshot anterior,
-     usando `walletID + ":" + assetSymbol` como chave.
-   - Iterar sobre os items do novo snapshot e comparar com o mapa.
-   - Reportar items novos (existem no novo mas nao no anterior).
-   - Reportar items removidos (existem no anterior mas nao no novo).
-   - Reportar items alterados (amounts diferentes).
+4. The comparison must:
+   - Build a map `key → WalletSnapshotItem` for the previous snapshot,
+     using `walletID + ":" + assetSymbol` as the key.
+   - Iterate the new snapshot's items and compare against the map.
+   - Report new items (present in new but not previous).
+   - Report removed items (present in previous but not new).
+   - Report changed items (different amounts).
 
-5. **`cmd/snapshot-runner/main.go`** — Adicione uma flag `--diff` que chama
-   `RunWithDiff` e imprime os diffs alem do snapshot.
+5. **`cmd/snapshot-runner/main.go`** — Add a `--diff` flag that calls
+   `RunWithDiff` and prints the diffs alongside the snapshot.
 
-### Dica
+### Hint
 
-- A comparacao nao precisa ser concorrente — ela opera em dados ja coletados em
-  memoria. O ponto do exercicio e integrar a logica de diff com o pipeline concorrente
-  existente.
-- Para detectar items removidos, apos iterar os novos items, verifique quais chaves
-  do mapa anterior nao foram visitadas.
-- Use `math.Abs(new - old) < 0.000001` para considerar valores iguais (floating point
-  comparison). Valores com diferenca menor que esse epsilon sao considerados iguais.
-- O `FindLatestCompleted` deve retornar `nil, nil` se nao existir snapshot anterior
-  (primeira execucao). Nesse caso, todos os items sao "novos" e nao ha diffs
-  significativos — retorne uma lista vazia de diffs.
+- The comparison doesn't need to be concurrent — it operates on data
+  already collected in memory. The point of the exercise is integrating
+  diff logic with the existing concurrent pipeline.
+- To detect removed items, after iterating the new items, check which
+  keys from the previous map were never visited.
+- Use `math.Abs(new - old) < 0.000001` to treat values as equal
+  (floating-point comparison). Values with differences smaller than that
+  epsilon should count as unchanged.
+- `FindLatestCompleted` should return `nil, nil` if no previous snapshot
+  exists (first run). In that case every item is "new" and there are no
+  meaningful diffs — return an empty slice.
 
-### Validacao
+### Acceptance
 
-- Execute `go run ./cmd/snapshot-runner` duas vezes. Na segunda execucao com `--diff`,
-  verifique:
-  - Se nenhum saldo mudou, a lista de diffs esta vazia.
-  - Adicione uma wallet nova no banco entre as duas execucoes e verifique que os items
-    da nova wallet aparecem como "novos" no diff.
-- Escreva um teste unitario que cria dois conjuntos de `WalletSnapshotItem` em memoria
-  e verifica a logica de comparacao (sem banco de dados).
-- `go test ./internal/snapshot/ -run TestSnapshotDiff -v` passa.
+- Run `go run ./cmd/snapshot-runner` twice. On the second run with
+  `--diff`, verify:
+  - If no balance changed, the diff list is empty.
+  - Add a new wallet to the database between runs and verify that the
+    new wallet's items appear as "new" in the diff.
+- Write a unit test that builds two in-memory `WalletSnapshotItem` sets
+  and verifies the comparison logic (no database required).
+- `go test ./internal/snapshot/ -run TestSnapshotDiff -v` passes.
 
 ---
 
-## Resumo
+## Wrap-up
 
-Apos completar todos os exercicios voce tera:
+After completing every exercise you will have:
 
-- **Fan-out broadcast** com 4 consumers independentes (Exercicio 1)
-- **Agregacao de resultados** do worker pool com persistencia (Exercicio 2)
-- **Select multiplexado** com map como acumulador (Exercicio 3)
-- **Rate limiting** integrado ao worker pool (Exercicio 4)
-- **Retry com backoff exponencial** usando o decorator pattern (Exercicio 5)
-- **Teste de integracao** verificando o pipeline end-to-end (Exercicio 6)
-- **Stage de filtragem stateful** no pipeline (Exercicio 7)
-- **Worker pool dinamico** com scale up/down automatico (Exercicio 8)
-- **WebSocket como alternativa ao polling** com a mesma interface de canal (Exercicio 9)
-- **Timeout por item** com partial failure (Exercicio 10)
-- **Benchmarks parametrizados** para decisoes baseadas em dados (Exercicio 11)
-- **Pipeline composto** com comparacao de snapshots (Exercicio 12)
+- **Fan-out broadcast** with 4 independent consumers (Exercise 1)
+- **Worker-pool aggregation** with persistence (Exercise 2)
+- **Multiplexed `select`** using a map as an accumulator (Exercise 3)
+- **Rate limiting** integrated into the worker pool (Exercise 4)
+- **Exponential-backoff retry** using the decorator pattern (Exercise 5)
+- **Integration test** covering the end-to-end pipeline (Exercise 6)
+- **Stateful filter stage** in the pipeline (Exercise 7)
+- **Dynamic worker pool** with auto scale-up/down (Exercise 8)
+- **WebSocket as an alternative to polling** with the same channel interface (Exercise 9)
+- **Per-item timeout** with partial failure (Exercise 10)
+- **Parametrized benchmarks** for data-driven decisions (Exercise 11)
+- **Composed pipeline** with snapshot comparison (Exercise 12)
 
-Execute o test suite completo ao final:
+Run the full test suite at the end:
 
 ```bash
 go test ./... -v -count=1 -race
 ```
 
-O flag `-race` ativa o race detector do Go — ele detecta acessos concorrentes a
-memoria compartilhada que nao estao protegidos por sincronizacao. Se algum teste
-falhar com `-race`, e um bug real de concorrencia que precisa ser corrigido.
+The `-race` flag enables Go's race detector — it flags concurrent access
+to shared memory that is not guarded by synchronization. If any test fails
+under `-race`, you have a real concurrency bug to fix.
+
+---
+
+# Module 3 — Professional Testing
+
+These exercises sit on top of Module 2: they **don't** ask you to rewrite
+the watcher or the snapshot runner. Instead, you'll write tests, fixtures,
+mocks, and benchmarks around the code that already exists.
+
+Before starting, make sure the baseline is green:
+
+```bash
+make test-unit
+make test-race
+```
+
+## Contents — Module 3
+
+| #   | Title | Difficulty | Key concepts |
+|-----|-------|------------|--------------|
+| M3.1 | Table-driven subtests for the normalizer | Beginner | `t.Run`, table tests, `testify/require` |
+| M3.2 | Mocking `BalanceProvider` with `testify/mock` | Beginner | `mock.On`, `mock.Anything`, `AssertExpectations` |
+| M3.3 | Context-cancellation test for the `snapshot.Runner` | Intermediate | `context.WithCancel`, `time.AfterFunc`, `atomic.Int32` |
+| M3.4 | Integration test with `anvil_setBalance` | Intermediate | `testcontainers-go`, chain mutation, DB asserts |
+| M3.5 | Benchmark and profile the normalizer | Intermediate | `go test -bench`, `-cpuprofile`, `go tool pprof` |
+| M3.6 | `go test -race` on a deliberately planted bug | Intermediate | Race detector, `sync/atomic`, reading the stack trace |
+| M3.7 | Impersonate + simulated transfer on Anvil | Advanced | `anvil_impersonateAccount`, `eth_sendTransaction`, full integration |
+
+---
+
+## Exercise M3.1: Table-driven subtests for the normalizer
+
+**Difficulty:** Beginner
+
+### Goal
+
+Add an extra table of cases in
+`internal/watcher/normalizer_extra_test.go` covering at least **four new
+scenarios** for `NormalizeTransferLog`.
+
+### Concepts involved
+
+- Table tests in Go (`[]struct { name ...; want ... }`).
+- Subtests with `t.Run(tt.name, func(t *testing.T) {...})` — each case
+  shows up as an individual test in the output, which makes debugging
+  failures easier.
+- `testify/require` for preconditions, `testify/assert` for independent
+  checks.
+
+### Suggested files
+
+- `internal/watcher/normalizer_extra_test.go` (add cases to
+  `TestNormalizeTransferLog_TableDriven`).
+
+### Acceptance criteria
+
+- At least 4 new cases added (e.g. `BlockNumber=""`, unknown `Address`,
+  `Removed=true` + tracked, tracked as `from` **and** `to`).
+- Every test passes with `go test ./internal/watcher/... -v -count=1`.
+- Scenario names (the `name` field) are descriptive; no `case1` filler.
+
+---
+
+## Exercise M3.2: Mocking `BalanceProvider` with testify/mock
+
+**Difficulty:** Beginner
+
+### Goal
+
+Use `internal/testutil/mocks` to test a happy path and an error path of
+`snapshot.Runner` **without** spinning up containers.
+
+### Concepts involved
+
+- `testify/mock`: `On`, `Return`, `Run`, `AssertExpectations`, `Maybe`.
+- The difference between hand-rolled stubs (as in `runner_test.go`) and
+  mocks (as in `runner_extra_test.go`).
+
+### Instructions
+
+1. Create a new file `internal/snapshot/runner_my_test.go`.
+2. Write two tests:
+   - `TestRunner_Run_PriceProviderRetriesTwice` — the price provider mock
+     returns an error on the first two calls and a valid price on the
+     third. Verify the final call count with
+     `priceProvider.AssertNumberOfCalls(t, "GetPriceUSD", 3)`. (Hint: the
+     current implementation does not retry — you'll see the test fail
+     with `AssertExpectations`. Document the current behaviour in a
+     comment; you don't have to implement the retry.)
+   - `TestRunner_Run_NoTokenProvider_OnlyNativeItems` — pass `nil` as
+     `tokenProvider` and verify that no `CreateSnapshotItem` call with
+     `AssetType = "erc20"` is made.
+
+### Suggested files
+
+- `internal/snapshot/runner_my_test.go`
+
+### Acceptance criteria
+
+- Both described scenarios are covered.
+- The mocks use `mock.On` with the right matchers (`mock.Anything` when
+  it doesn't matter; concrete values when it does).
+- `go test ./internal/snapshot/... -v` passes (with the caveat from the
+  first test if retry isn't implemented).
+
+---
+
+## Exercise M3.3: Context-cancellation test for the `snapshot.Runner`
+
+**Difficulty:** Intermediate
+
+### Goal
+
+Write a test that proves `snapshot.Runner` **stops processing wallets**
+as soon as the context is cancelled, instead of draining the queue.
+
+### Concepts involved
+
+- `context.WithCancel`, `time.AfterFunc`.
+- `sync/atomic` to count calls without a race condition.
+- Go's contract: **cancelling a context does not kill goroutines** — it
+  signals. Only code that properly observes `ctx.Done()` respects the
+  cancel.
+
+### Instructions
+
+1. Follow the pattern of `TestRunner_Run_ContextCancellation` in
+   `runner_extra_test.go`. Build a scenario with 20 wallets and 2 workers.
+2. Configure `BalanceProvider.GetBalance` to block for 100ms while
+   observing `ctx.Done()`.
+3. Use `time.AfterFunc(150*time.Millisecond, cancel)` so that cancel
+   fires after a single batch of workers has finished.
+4. Assert that `balanceCalls.Load() < 20`.
+
+### Suggested files
+
+- Add a variant to `runner_extra_test.go` (or a new file).
+
+### Acceptance criteria
+
+- The test passes under `-race`:
+  `go test ./internal/snapshot/... -race -v`.
+- The test fails if you comment out the internal
+  `select { case <-ctx.Done(): return }` branches in the worker pool (try
+  it!).
+
+---
+
+## Exercise M3.4: Integration test with `anvil_setBalance`
+
+**Difficulty:** Intermediate
+
+### Goal
+
+Write a new **integration test** that:
+
+1. Uses `ethutil.SetEthBalance` to set 0 ETH on a brand-new address.
+2. Runs the full `snapshot.Runner`.
+3. Verifies that the resulting DB row has `amount = 0` and
+   `usd_value = 0`.
+
+### Concepts involved
+
+- `testcontainers-go` + the `integration` build tag.
+- Helpers in `internal/testutil/ethutil`.
+- Direct assertions against live Postgres via `env.DB.QueryRowContext`.
+
+### Instructions
+
+1. Create `test/integration/snapshot_zero_balance_test.go`.
+2. Copy the format of `snapshot_integration_test.go`: build tag,
+   package, imports.
+3. Seed a user + a wallet with `seedUserAndWallet`, then call
+   `ethutil.SetEthBalance(ctx, rpc, addr, "0x0")` to force zero.
+4. Run the runner, then query:
+   ```go
+   var amount, usdValue float64
+   err := env.DB.QueryRowContext(ctx, `
+       SELECT amount, usd_value FROM wallet_snapshot_items
+       WHERE wallet_id = $1 AND asset_type = 'native'`, "w-zero").Scan(&amount, &usdValue)
+   ```
+5. Assert both are zero.
+
+### Acceptance criteria
+
+- `make test-integration` picks up the new test and it passes.
+- If you comment out the `SetEthBalance` line and use
+  `ethutil.EthToWei(1)` instead, the test fails correctly.
+
+---
+
+## Exercise M3.5: Benchmark and profile the normalizer
+
+**Difficulty:** Intermediate
+
+### Goal
+
+Identify the hot path of `NormalizeTransferLog` using `pprof` and propose
+one optimisation (implementing it is optional).
+
+### Concepts involved
+
+- `go test -bench` + `-cpuprofile`, `-memprofile`.
+- `go tool pprof`, especially `-top` and `-list`.
+- Reading `flat%` vs `cum%`.
+
+### Instructions
+
+1. Run:
+   ```bash
+   go test ./internal/watcher -bench=BenchmarkNormalizeTransferLog_Hit \
+       -cpuprofile=cpu.out -benchtime=3s -run=^$
+   ```
+2. Analyse:
+   ```bash
+   go tool pprof -top -nodecount=10 cpu.out
+   go tool pprof -list NormalizeTransferLog cpu.out
+   ```
+3. In a comment at the top of `normalizer_extra_test.go`, write 3 bullet
+   points answering:
+   - Which function eats the most CPU inside the normalizer?
+   - Which allocation is the most expensive?
+   - An optimisation proposal (e.g. reuse `big.Int` via `sync.Pool`;
+     cache `strings.ToLower`; etc.).
+
+### Acceptance criteria
+
+- The benchmark runs and produces `cpu.out`.
+- The comment exists, is specific, and is grounded in the pprof output.
+
+---
+
+## Exercise M3.6: `go test -race` on a deliberately planted bug
+
+**Difficulty:** Intermediate
+
+### Goal
+
+Plant a race-condition bug inside `watcher.metricsWorker` and prove Go's
+race detector finds it.
+
+### Concepts involved
+
+- Go's race detector (`-race`).
+- When `int` **is not** safe for concurrent access.
+- `sync/atomic.Int64` as a fix.
+
+### Instructions
+
+1. In `internal/watcher/watcher.go`, inside `metricsWorker`, replace the
+   `incoming` and `outgoing` locals with shared state outside the
+   goroutine (create an exported `metrics` struct with plain `int64`
+   counters — **no atomic**).
+2. In a new test
+   `internal/watcher/watcher_race_test.go`, spin up a second goroutine
+   that reads the counters while the watcher increments them. Run:
+   ```bash
+   go test ./internal/watcher/... -race -run TestWatcherMetricsRace
+   ```
+3. Observe the `WARNING: DATA RACE` output. Paste the stack trace into a
+   comment inside the test.
+4. Fix it with `atomic.Int64` and prove `-race` comes back green.
+5. **At the end, revert every production change** — the original code
+   had no bug. The exercise is didactic only.
+
+### Acceptance criteria
+
+- Before the fix: `-race` reports a data race with a stack trace
+  pointing at the shared field.
+- After the fix: `-race` is clean.
+- The exercise reverts the production changes and keeps only the test
+  (adjusted to the original counters) on a separate branch.
+
+---
+
+## Exercise M3.7: Impersonate + simulated transfer on Anvil
+
+**Difficulty:** Advanced
+
+### Goal
+
+Use `ethutil.Impersonate` + `eth_sendTransaction` to simulate an on-chain
+transfer between two wallets, then validate that the watcher (running
+against Anvil) persists the event in Postgres.
+
+### Concepts involved
+
+- `anvil_impersonateAccount` — acting as an address without its private
+  key.
+- `eth_sendTransaction` via `ethutil.Client.Call`.
+- End-to-end integration: watcher + Postgres + Anvil.
+
+### Instructions
+
+1. In `test/integration/watcher_integration_test.go` (new file with
+   `//go:build integration`):
+   - Seed a tracked wallet (`w-source`) with 10 ETH.
+   - Impersonate `w-source`.
+   - Call `eth_sendTransaction` with `from=w-source`, `to=w-dest`,
+     `value=0x1`.
+   - Start `watcher.NewWatcher(...).Run(ctx)` in a goroutine.
+   - Wait until the event appears in the `wallet_events` table (poll
+     with a reasonable timeout, e.g. 10s).
+2. **Heads up:** the current watcher only filters **ERC-20 Transfer**
+   events, not native ETH transfers. You'll need to deploy a simple
+   ERC-20 contract on Anvil (or use `anvil_setCode` to inject a mock)
+   and call `transfer` on it. Alternatively, document that native ETH
+   isn't captured by the current watcher and write the test against a
+   pre-loaded ERC-20 contract.
+
+### Acceptance criteria
+
+- `make test-integration` passes.
+- The test verifies in the DB that a `wallet_events` row with
+  `direction=incoming` or `outgoing` was persisted.
+- The test cleans up the chain / DB between runs (idempotent).
+
+---
+
+## General tips — Module 3
+
+1. **Use `t.Context()`** instead of `context.Background()` in tests. It
+   cancels automatically when the test finishes, which helps
+   testcontainers clean up orphan containers.
+2. **Avoid `time.Sleep`** for synchronising tests. Prefer channels,
+   `sync.WaitGroup`, or testify's `require.Eventually(...)`.
+3. **Benchmarks are not a ranking.** `1ms/op` on an M1 laptop can be
+   `3ms/op` on x86 CI. Use benchmarks to **compare alternatives on the
+   same machine**, not to report absolute numbers.
+4. **The race detector is not magic.** It only catches races that
+   actually happened during the test run. Combine it with property-style
+   tests (counts, sums) that fail even when the race isn't observed.
