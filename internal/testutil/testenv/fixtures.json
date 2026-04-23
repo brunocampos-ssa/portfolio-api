@@ -1,0 +1,17 @@
+{
+  "native_balance_eth": 10,
+  "tokens": {
+    "USDC": {
+      "contract": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+      "whale":    "0x40ec5B33f54e0E8A33A975908C5BA1c14e5BbbDf",
+      "amount":   "1000000000",
+      "decimals": 6
+    },
+    "USDT": {
+      "contract": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+      "whale":    "0xF977814e90dA44bFA03b6295A0616a897441aceC",
+      "amount":   "500000000",
+      "decimals": 6
+    }
+  }
+}
