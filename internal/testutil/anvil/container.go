@@ -33,6 +33,11 @@ import (
 	anvilimg "github.com/brunocampos-ssa/portfolio-api/test/infrastructure/anvil"
 )
 
+// rpcPort is the Anvil public TCP port, declared in "port/proto" form so
+// every testcontainers-go API (ExposedPorts, ForListeningPort, MappedPort)
+// sees the same value.
+const rpcPort = "8545/tcp"
+
 // Options tune the underlying anvil invocation.
 // Zero values produce a sensible default (empty-state, no fork, instant mining).
 type Options struct {
@@ -95,14 +100,14 @@ func Start(ctx context.Context, opts ...Options) (*Handle, error) {
 			Dockerfile:     "Dockerfile",
 			KeepImage:      true, // avoid rebuilding on every test run
 		},
-		ExposedPorts: []string{"8545/tcp"},
+		ExposedPorts: []string{rpcPort},
 		Env: map[string]string{
 			"ANVIL_ARGS":          opt.AnvilArgs,
 			"ANVIL_PORT":          "8545",
 			"ANVIL_PORT_INTERNAL": "9000",
 		},
 		WaitingFor: wait.ForAll(
-			wait.ForListeningPort("8545/tcp"),
+			wait.ForListeningPort(rpcPort),
 			// The "Listening on" line is printed by anvil itself, proving the
 			// binary is serving requests (not just the socat socket).
 			wait.ForLog("Listening on"),
@@ -123,7 +128,10 @@ func Start(ctx context.Context, opts ...Options) (*Handle, error) {
 		return nil, fmt.Errorf("anvil.Start: container host: %w", err)
 	}
 
-	port, err := container.MappedPort(ctx, "8545")
+	// rpcPort (not bare "8545") matches the ExposedPorts declaration
+	// above. testcontainers-go generally accepts the bare form via
+	// normalization, but the qualified form is unambiguous across versions.
+	port, err := container.MappedPort(ctx, rpcPort)
 	if err != nil {
 		_ = container.Terminate(context.Background())
 		return nil, fmt.Errorf("anvil.Start: mapped port: %w", err)

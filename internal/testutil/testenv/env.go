@@ -96,6 +96,7 @@ type Env struct {
 	DB          *sql.DB
 	DatabaseURL string
 	Anvil       *anvil.Handle
+	Postgres    *postgres.Handle
 	Fixtures    Fixtures
 }
 
@@ -155,7 +156,7 @@ func Setup(ctx context.Context, opts ...Options) (*Env, error) {
 	defer cancel()
 
 	type pgResult struct {
-		dsn string
+		h   *postgres.Handle
 		err error
 	}
 	type anvilResult struct {
@@ -167,8 +168,8 @@ func Setup(ctx context.Context, opts ...Options) (*Env, error) {
 	anvilCh := make(chan anvilResult, 1)
 
 	go func() {
-		dsn, err := postgres.GetPostgresContainer(bootCtx)
-		pgCh <- pgResult{dsn, err}
+		h, err := postgres.Start(bootCtx)
+		pgCh <- pgResult{h, err}
 	}()
 	go func() {
 		h, err := anvil.Start(bootCtx, anvil.Options{
@@ -181,9 +182,15 @@ func Setup(ctx context.Context, opts ...Options) (*Env, error) {
 	pg := <-pgCh
 	av := <-anvilCh
 
+	// cleanup is idempotent and tolerates nil handles — safe to call on any
+	// Setup failure path. Stops BOTH containers so nothing leaks when one
+	// side started successfully and the other errored.
 	cleanup := func() {
 		if av.h != nil {
 			_ = av.h.Stop(context.Background())
+		}
+		if pg.h != nil {
+			_ = pg.h.Stop(context.Background())
 		}
 	}
 	if pg.err != nil {
@@ -191,14 +198,11 @@ func Setup(ctx context.Context, opts ...Options) (*Env, error) {
 		return nil, fmt.Errorf("testenv.Setup: postgres: %w", pg.err)
 	}
 	if av.err != nil {
-		// Even when av.err is non-nil, av.h may be populated if Anvil booted
-		// far enough to hand back a container before the error surfaced.
-		// cleanup() is a no-op when av.h is nil, so calling it is safe.
 		cleanup()
 		return nil, fmt.Errorf("testenv.Setup: anvil fork: %w", av.err)
 	}
 
-	db, err := sql.Open("postgres", pg.dsn)
+	db, err := sql.Open("postgres", pg.h.DSN)
 	if err != nil {
 		cleanup()
 		return nil, fmt.Errorf("testenv.Setup: open postgres: %w", err)
@@ -232,8 +236,9 @@ func Setup(ctx context.Context, opts ...Options) (*Env, error) {
 
 	env := &Env{
 		DB:          db,
-		DatabaseURL: pg.dsn,
+		DatabaseURL: pg.h.DSN,
 		Anvil:       av.h,
+		Postgres:    pg.h,
 		Fixtures:    fx,
 	}
 
@@ -248,19 +253,25 @@ func Setup(ctx context.Context, opts ...Options) (*Env, error) {
 	return env, nil
 }
 
-// Close tears down the Postgres handle and the forked Anvil container. It
-// is idempotent (safe to call on a partially-built Env from a failed Setup).
+// Close tears down the DB handle, the forked Anvil container, AND the
+// Postgres container. It is idempotent and safe on a partially-built Env
+// returned from a failed Setup. The first error encountered is returned;
+// later teardown steps still run.
 func (e *Env) Close(ctx context.Context) error {
 	var firstErr error
-	if e.DB != nil {
-		if err := e.DB.Close(); err != nil {
+	capture := func(err error) {
+		if err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
+	if e.DB != nil {
+		capture(e.DB.Close())
+	}
 	if e.Anvil != nil {
-		if err := e.Anvil.Stop(ctx); err != nil && firstErr == nil {
-			firstErr = err
-		}
+		capture(e.Anvil.Stop(ctx))
+	}
+	if e.Postgres != nil {
+		capture(e.Postgres.Stop(ctx))
 	}
 	return firstErr
 }

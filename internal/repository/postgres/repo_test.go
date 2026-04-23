@@ -14,12 +14,17 @@ import (
 var database *sql.DB
 
 func TestMain(m *testing.M) {
-	databaseURL, err := postgres.GetPostgresContainer(context.Background())
+	ctx := context.Background()
+
+	pg, err := postgres.Start(ctx)
 	if err != nil {
 		log.Fatalf("FATAL: start PostgreSQL container: %v", err)
 	}
+	// Container teardown lives with the test binary exit — we want it to
+	// run even when tests fail, which is why os.Exit is invoked at the end.
+	defer func() { _ = pg.Stop(context.Background()) }()
 
-	database, err = sql.Open("postgres", databaseURL)
+	database, err = sql.Open("postgres", pg.DSN)
 	if err != nil {
 		log.Fatalf("FATAL: connect to PostgreSQL container: %v", err)
 	}
@@ -33,9 +38,11 @@ func TestMain(m *testing.M) {
 		log.Fatalf("FATAL: run migrations: %v", err)
 	}
 
-	// Run tests.
+	// Run tests. Note: os.Exit skips deferred functions, so the cleanup
+	// chain below relies on being the last thing we do before exit.
 	code := m.Run()
 
-	// Exit with the test code.
+	_ = database.Close()
+	_ = pg.Stop(context.Background())
 	os.Exit(code)
 }
