@@ -30,13 +30,29 @@ import (
 // The selector is hardcoded because recomputing keccak256 would drag in
 // an extra dependency. If Solidity's signature ever changes this must be
 // updated — unlikely on the order of millennia.
-func ERC20TransferCalldata(recipient string, amount *big.Int) string {
+//
+// Returns an error (rather than a silent fallback) when inputs are
+// malformed, so callers surface the bug instead of sending a transfer to
+// the zero address.
+func ERC20TransferCalldata(recipient string, amount *big.Int) (string, error) {
 	const selector = "0xa9059cbb"
+	if err := validateAddress(recipient); err != nil {
+		return "", fmt.Errorf("ethutil.ERC20TransferCalldata: recipient: %w", err)
+	}
+	if amount == nil {
+		return "", fmt.Errorf("ethutil.ERC20TransferCalldata: amount is nil")
+	}
+	if amount.Sign() < 0 {
+		return "", fmt.Errorf("ethutil.ERC20TransferCalldata: amount is negative")
+	}
 	addr := strings.ToLower(strings.TrimPrefix(recipient, "0x"))
 	addrPadded := strings.Repeat("0", 64-len(addr)) + addr
 	amountHex := amount.Text(16)
+	if len(amountHex) > 64 {
+		return "", fmt.Errorf("ethutil.ERC20TransferCalldata: amount exceeds uint256")
+	}
 	amountPadded := strings.Repeat("0", 64-len(amountHex)) + amountHex
-	return selector + addrPadded + amountPadded
+	return selector + addrPadded + amountPadded, nil
 }
 
 // Receipt is the subset of eth_getTransactionReceipt we care about.
@@ -121,7 +137,10 @@ func TransferERC20(ctx context.Context, rpc *Client, token, whale, to string, am
 	if err := SetEthBalance(ctx, rpc, whale, HexWei(EthToWei(10))); err != nil {
 		return "", err
 	}
-	data := ERC20TransferCalldata(to, amount)
+	data, err := ERC20TransferCalldata(to, amount)
+	if err != nil {
+		return "", err
+	}
 	hash, err := SendTransaction(ctx, rpc, whale, token, data)
 	if err != nil {
 		return "", err

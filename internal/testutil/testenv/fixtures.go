@@ -4,7 +4,14 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"math/big"
 )
+
+// maxDecimals is the upper bound for ERC-20 `decimals`. Real tokens in the
+// wild never exceed 18 (the ether base unit), and anything above ~30 would
+// overflow float64 when we scale down for assertions. We clamp at 36 to
+// accept a reasonable safety margin without accepting obviously bogus data.
+const maxDecimals = 36
 
 // =============================================================================
 // Fixtures define the on-chain state that Bootstrap applies for every tracked
@@ -44,6 +51,10 @@ type TokenFixture struct {
 
 // loadFixtures parses the embedded fixtures.json. It is called once per
 // Setup and the result is cached on *Env.
+//
+// Every check trips the error path with a specific, actionable message so
+// a malformed fixture fails Setup immediately rather than producing a
+// confusing panic deep inside Bootstrap or SeedToken.
 func loadFixtures() (Fixtures, error) {
 	var f Fixtures
 	if err := json.Unmarshal(fixturesRaw, &f); err != nil {
@@ -55,6 +66,22 @@ func loadFixtures() (Fixtures, error) {
 	for sym, tok := range f.Tokens {
 		if tok.Contract == "" || tok.Whale == "" || tok.Amount == "" {
 			return Fixtures{}, fmt.Errorf("testenv: fixtures.tokens[%s] has an empty required field", sym)
+		}
+		if tok.Decimals < 0 || tok.Decimals > maxDecimals {
+			return Fixtures{}, fmt.Errorf(
+				"testenv: fixtures.tokens[%s].decimals=%d out of range [0, %d]",
+				sym, tok.Decimals, maxDecimals)
+		}
+		n, ok := new(big.Int).SetString(tok.Amount, 10)
+		if !ok {
+			return Fixtures{}, fmt.Errorf(
+				"testenv: fixtures.tokens[%s].amount=%q is not a base-10 uint256",
+				sym, tok.Amount)
+		}
+		if n.Sign() < 0 {
+			return Fixtures{}, fmt.Errorf(
+				"testenv: fixtures.tokens[%s].amount=%q must be non-negative",
+				sym, tok.Amount)
 		}
 	}
 	return f, nil
