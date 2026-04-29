@@ -18,6 +18,7 @@ package mocks
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	"github.com/stretchr/testify/mock"
 
@@ -27,14 +28,15 @@ import (
 
 // Ensure mocks satisfy the interfaces at compile time.
 var (
-	_ contracts.UserRepository       = (*UserRepository)(nil)
-	_ contracts.WalletRepository     = (*WalletRepository)(nil)
-	_ contracts.EventRepository      = (*EventRepository)(nil)
-	_ contracts.SnapshotRepository   = (*SnapshotRepository)(nil)
-	_ contracts.BalanceProvider      = (*BalanceProvider)(nil)
-	_ contracts.TokenBalanceProvider = (*TokenBalanceProvider)(nil)
-	_ contracts.PriceProvider        = (*PriceProvider)(nil)
-	_ contracts.LogsFetcher          = (*LogsFetcher)(nil)
+	_ contracts.UserRepository         = (*UserRepository)(nil)
+	_ contracts.WalletRepository       = (*WalletRepository)(nil)
+	_ contracts.EventRepository        = (*EventRepository)(nil)
+	_ contracts.SnapshotRepository     = (*SnapshotRepository)(nil)
+	_ contracts.RefreshTokenRepository = (*RefreshTokenRepository)(nil)
+	_ contracts.BalanceProvider        = (*BalanceProvider)(nil)
+	_ contracts.TokenBalanceProvider   = (*TokenBalanceProvider)(nil)
+	_ contracts.PriceProvider          = (*PriceProvider)(nil)
+	_ contracts.LogsFetcher            = (*LogsFetcher)(nil)
 )
 
 // -----------------------------------------------------------------------------
@@ -47,6 +49,40 @@ func (m *UserRepository) FindByID(ctx context.Context, id string) (*domain.User,
 	args := m.Called(ctx, id)
 	u, _ := args.Get(0).(*domain.User)
 	return u, args.Error(1)
+}
+
+func (m *UserRepository) FindByEmail(ctx context.Context, email string) (*domain.User, error) {
+	args := m.Called(ctx, email)
+	u, _ := args.Get(0).(*domain.User)
+	return u, args.Error(1)
+}
+
+func (m *UserRepository) Create(ctx context.Context, user *domain.User, passwordHash string) error {
+	return m.Called(ctx, user, passwordHash).Error(0)
+}
+
+type RefreshTokenRepository struct{ mock.Mock }
+
+func (m *RefreshTokenRepository) Insert(ctx context.Context, t *domain.RefreshToken) error {
+	return m.Called(ctx, t).Error(0)
+}
+
+func (m *RefreshTokenRepository) FindByHash(ctx context.Context, tokenHash string) (*domain.RefreshToken, error) {
+	args := m.Called(ctx, tokenHash)
+	t, _ := args.Get(0).(*domain.RefreshToken)
+	return t, args.Error(1)
+}
+
+func (m *RefreshTokenRepository) MarkRotated(ctx context.Context, oldID, newID string, revokedAt time.Time) error {
+	return m.Called(ctx, oldID, newID, revokedAt).Error(0)
+}
+
+func (m *RefreshTokenRepository) Revoke(ctx context.Context, id string, revokedAt time.Time) error {
+	return m.Called(ctx, id, revokedAt).Error(0)
+}
+
+func (m *RefreshTokenRepository) RevokeFamily(ctx context.Context, startID string, revokedAt time.Time) error {
+	return m.Called(ctx, startID, revokedAt).Error(0)
 }
 
 type WalletRepository struct{ mock.Mock }

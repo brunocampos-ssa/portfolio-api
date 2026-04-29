@@ -31,6 +31,15 @@ func (m *mockUserRepo) FindByID(_ context.Context, id string) (*domain.User, err
 	return user, nil
 }
 
+// Stubs added in Module 4 — handler tests don't exercise these paths.
+func (m *mockUserRepo) FindByEmail(_ context.Context, _ string) (*domain.User, error) {
+	return nil, fmt.Errorf("UserRepository.FindByEmail: %w", domain.ErrUserNotFound)
+}
+
+func (m *mockUserRepo) Create(_ context.Context, _ *domain.User, _ string) error {
+	return fmt.Errorf("not implemented in this mock")
+}
+
 type mockWalletRepo struct {
 	wallets map[string][]domain.Wallet
 }
