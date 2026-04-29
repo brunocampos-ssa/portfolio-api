@@ -44,13 +44,13 @@ func TestWatcherForkedMainnetUSDCTransfer(t *testing.T) {
 
 	usdc := env.Fixtures.Tokens["USDC"]
 
-	// Fire a fresh 1-USDC transfer into the tracked wallet. The whale still
+	// Fire a fresh 500-USDC transfer into the tracked wallet. The whale still
 	// has plenty of USDC after bootstrap.
 	txHash, err := env.TransferERC20(ctx,
 		usdc.Contract,
 		usdc.Whale,
 		tracked,
-		big.NewInt(1_000_000), // 1.0 USDC (6 decimals)
+		big.NewInt(500_000_000), // 500.0 USDC (6 decimals)
 	)
 	require.NoError(t, err)
 	require.NotEmpty(t, txHash)

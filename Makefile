@@ -74,7 +74,7 @@ test-unit:
 	go test ./... -count=1 -timeout 2m
 
 test-integration:
-	go test -tags=integration ./test/integration/... -count=1 -timeout 10m
+	go test -tags=integration ./... -count=1 -timeout 10m
 
 test-race:
 	go test ./... -count=1 -race -timeout 3m
