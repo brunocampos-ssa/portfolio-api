@@ -50,7 +50,7 @@ func TestWatcherForkedMainnetUSDCTransfer(t *testing.T) {
 		usdc.Contract,
 		usdc.Whale,
 		tracked,
-		big.NewInt(1_000_000), // 1.0 USDC (6 decimals)
+		big.NewInt(500_000_000), // 500.0 USDC (6 decimals)
 	)
 	require.NoError(t, err)
 	require.NotEmpty(t, txHash)
