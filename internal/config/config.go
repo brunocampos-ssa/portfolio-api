@@ -12,6 +12,7 @@ import (
 type Config struct {
 	// Shared
 	Port        string
+	GRPCPort    string
 	DatabaseURL string
 
 	// API
@@ -45,6 +46,7 @@ type Config struct {
 func Load() (*Config, error) {
 	cfg := &Config{
 		Port:            getEnv("PORT", "8080"),
+		GRPCPort:        getEnv("GRPC_PORT", "50051"),
 		DatabaseURL:     getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/portfolio?sslmode=disable"),
 		EthRPCURL:       getEnv("ETH_RPC_URL", "https://eth.drpc.org/"),
 		KleverBaseURL:   getEnv("KLEVER_API_BASE_URL", "https://api.mainnet.klever.org"),

@@ -1,17 +1,29 @@
 package main
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
 
 	_ "github.com/lib/pq"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/reflection"
 
+	pb "github.com/brunocampos-ssa/portfolio-api/gen/portfolio/v1"
 	"github.com/brunocampos-ssa/portfolio-api/internal/auth"
 	"github.com/brunocampos-ssa/portfolio-api/internal/config"
 	"github.com/brunocampos-ssa/portfolio-api/internal/contracts"
+	"github.com/brunocampos-ssa/portfolio-api/internal/grpcapi"
 	"github.com/brunocampos-ssa/portfolio-api/internal/httpapi"
 	"github.com/brunocampos-ssa/portfolio-api/internal/middleware"
 	"github.com/brunocampos-ssa/portfolio-api/internal/provider/blockchain"
@@ -22,8 +34,6 @@ import (
 
 func main() {
 	// --- Configuration ---
-	// Load and validate configuration at startup.
-	// Fail fast if required values are missing.
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("FATAL: load config: %v", err)
@@ -35,16 +45,12 @@ func main() {
 		log.Fatalf("FATAL: open database: %v", err)
 	}
 	defer db.Close()
-
 	if err := db.Ping(); err != nil {
 		log.Fatalf("FATAL: ping database: %v", err)
 	}
 	log.Println("Connected to PostgreSQL")
 
 	// --- Repositories ---
-	// Constructors panic if db is nil — defensive programming.
-	// This can never happen here (we just validated db), but the
-	// constructors protect against misuse in other contexts.
 	userRepo := postgres.NewUserRepository(db)
 	walletRepo := postgres.NewWalletRepository(db)
 	refreshRepo := postgres.NewRefreshTokenRepository(db)
@@ -52,14 +58,12 @@ func main() {
 	// --- Blockchain providers ---
 	ethProvider := blockchain.NewEthereumProvider(cfg.EthRPCURL)
 	klvProvider := blockchain.NewKleverProvider(cfg.KleverBaseURL)
-
 	registry := blockchain.NewProviderRegistry()
 	registry.Register(ethProvider)
 	registry.Register(klvProvider)
 	log.Printf("Registered blockchain providers: ethereum, klever")
 
 	// --- Price provider ---
-	// If no API key, use mock provider — graceful degradation.
 	var priceProvider contracts.PriceProvider
 	if cfg.CoinGeckoAPIKey != "" {
 		priceProvider = pricing.NewCoinGeckoPriceProvider(cfg.CoinGeckoAPIKey)
@@ -69,15 +73,8 @@ func main() {
 		log.Println("Price provider: Mock (COINGECKO_DEMO_API_KEY not set)")
 	}
 
-	// --- Auth primitives (Module 4 Aula 1) ---
-	// Hasher: argon2id with OWASP-leaning defaults. Cost is ~50–150 ms
-	// per verify on a developer laptop.
+	// --- Auth primitives (shared between HTTP and gRPC) ---
 	hasher := auth.NewArgon2idHasher()
-
-	// Tokens: HS256, 15-minute access tokens, 30-day refresh tokens.
-	// JWT_SIGNING_KEY MUST be set in non-dev environments. In dev we
-	// fall back to a deterministic 32-byte value so `make run` works
-	// out of the box.
 	signingKey := []byte(cfg.JWTSigningKey)
 	if len(signingKey) < 32 {
 		log.Println("WARN: JWT_SIGNING_KEY missing or too short; using insecure dev default — DO NOT SHIP")
@@ -90,22 +87,82 @@ func main() {
 	portfolioService := service.NewPortfolioService(userRepo, walletRepo, registry, priceProvider)
 	authService := service.NewAuthService(userRepo, refreshRepo, hasher, tokenIssuer, service.DefaultRefreshTokenTTL)
 
-	// --- HTTP handlers ---
-	apiHandler := httpapi.NewHandler(portfolioService)
-	authHandler := httpapi.NewAuthHandler(authService)
+	// --- HTTP server ---
+	httpHandler := buildHTTPHandler(portfolioService, authService, tokenVerifier)
+	httpServer := &http.Server{
+		Addr:              fmt.Sprintf(":%s", cfg.Port),
+		Handler:           httpHandler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 
-	// --- Routing ---
+	// --- gRPC server ---
+	grpcServer := buildGRPCServer(portfolioService, authService, tokenVerifier)
+	grpcLis, err := net.Listen("tcp", fmt.Sprintf(":%s", cfg.GRPCPort))
+	if err != nil {
+		log.Fatalf("FATAL: gRPC listen: %v", err)
+	}
+
+	// --- Lifecycle: run both servers concurrently, shut both down on signal ---
 	//
-	// Two-mux split for clean auth boundaries:
+	// We use a stop context that fires on SIGINT / SIGTERM. Each server
+	// gets its own goroutine; ListenAndServe blocks, so we have to push
+	// it onto a goroutine to compose with shutdown.
 	//
-	//   * publicMux receives endpoints that MUST stay open: /health,
-	//     /auth/*, and the educational /debug/panic endpoints.
-	//   * protectedMux receives /users/{id}/* — anything that returns
-	//     user-owned data. The JWT middleware wraps the entire sub-mux,
-	//     so adding a new protected route is just one HandleFunc call
-	//     on protectedMux and it inherits authentication automatically.
-	//
-	// The outer mux dispatches to the right inner mux by path prefix.
+	// Module 2 introduced errgroup-style patterns. Here we keep it
+	// stdlib-only with sync.WaitGroup and channels — same idea, fewer
+	// dependencies — so the gRPC chapter doesn't drag in concurrency
+	// patterns the lesson hasn't introduced yet.
+	stopCtx, stopSig := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stopSig()
+
+	logRoutes(cfg)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		log.Printf("HTTP server listening on %s", httpServer.Addr)
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("HTTP server error: %v", err)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		log.Printf("gRPC server listening on %s", grpcLis.Addr())
+		if err := grpcServer.Serve(grpcLis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+			log.Printf("gRPC server error: %v", err)
+		}
+	}()
+
+	<-stopCtx.Done()
+	log.Println("Shutdown signal received, draining…")
+
+	// Bounded shutdown — give in-flight requests a few seconds.
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelShutdown()
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("HTTP shutdown error: %v", err)
+	}
+	grpcServer.GracefulStop()
+
+	wg.Wait()
+	log.Println("Bye.")
+}
+
+// buildHTTPHandler wires the REST routing tree (two-mux split + middleware).
+func buildHTTPHandler(
+	portfolio *service.PortfolioService,
+	authSvc *service.AuthService,
+	verifier *auth.TokenVerifier,
+) http.Handler {
+	apiHandler := httpapi.NewHandler(portfolio)
+	authHandler := httpapi.NewAuthHandler(authSvc)
+
 	publicMux := http.NewServeMux()
 	apiHandler.RegisterPublicRoutes(publicMux)
 	authHandler.RegisterRoutes(publicMux)
@@ -114,37 +171,50 @@ func main() {
 	apiHandler.RegisterProtectedRoutes(protectedMux)
 
 	rootMux := http.NewServeMux()
-	// /users/* → JWT-gated subtree
-	rootMux.Handle("/users/", middleware.JWT(tokenVerifier)(protectedMux))
-	// Everything else → public subtree (the inner mux still does method/path matching)
+	rootMux.Handle("/users/", middleware.JWT(verifier)(protectedMux))
 	rootMux.Handle("/", publicMux)
 
-	// --- Outer middleware stack ---
-	// RequestID → Logging → Recovery → rootMux
-	// Recovery is innermost so it catches panics from handlers.
-	// Logging wraps recovery so it logs the final status code.
-	// RequestID is outermost so all layers have access to the ID.
 	var h http.Handler = rootMux
 	h = middleware.Recovery(h)
 	h = middleware.Logging(h)
 	h = middleware.RequestID(h)
+	return h
+}
 
-	addr := fmt.Sprintf(":%s", cfg.Port)
+// buildGRPCServer assembles the gRPC server with the auth interceptor and
+// every service registered. The standard health service is registered
+// last so /grpc.health.v1.Health/Check is always available.
+func buildGRPCServer(
+	portfolio *service.PortfolioService,
+	authSvc *service.AuthService,
+	verifier *auth.TokenVerifier,
+) *grpc.Server {
+	srv := grpc.NewServer(
+		grpc.UnaryInterceptor(grpcapi.UnaryAuthInterceptor(verifier)),
+	)
 
-	// http.Server with explicit timeouts. Module 4 also adds these here
-	// because once we accept tokens we want bounded request lifetimes —
-	// no slowloris.
-	server := &http.Server{
-		Addr:              addr,
-		Handler:           h,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      15 * time.Second,
-		IdleTimeout:       60 * time.Second,
-	}
+	pb.RegisterAuthServiceServer(srv, grpcapi.NewAuthServer(authSvc))
+	pb.RegisterPortfolioServiceServer(srv, grpcapi.NewPortfolioServer(portfolio))
+	pb.RegisterWalletServiceServer(srv, grpcapi.NewWalletServer(portfolio))
 
-	log.Printf("Starting server on %s", addr)
-	log.Printf("Endpoints:")
+	// Standard health checking — clients that probe the server (LB, k8s)
+	// expect this. We mark every service Serving once we're up.
+	hsrv := health.NewServer()
+	healthpb.RegisterHealthServer(srv, hsrv)
+	hsrv.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
+	hsrv.SetServingStatus("portfolio.v1.AuthService", healthpb.HealthCheckResponse_SERVING)
+	hsrv.SetServingStatus("portfolio.v1.PortfolioService", healthpb.HealthCheckResponse_SERVING)
+	hsrv.SetServingStatus("portfolio.v1.WalletService", healthpb.HealthCheckResponse_SERVING)
+
+	// Reflection lets `grpcurl` discover services without a copy of the
+	// .proto files. Pure dev convenience; safe to leave on.
+	reflection.Register(srv)
+
+	return srv
+}
+
+func logRoutes(cfg *config.Config) {
+	log.Printf("REST endpoints (port %s):", cfg.Port)
 	log.Printf("  POST /auth/register")
 	log.Printf("  POST /auth/login")
 	log.Printf("  POST /auth/refresh")
@@ -155,5 +225,9 @@ func main() {
 	log.Printf("  POST /users/{id}/wallets           (JWT, self only)")
 	log.Printf("  GET  /debug/panic                  (educational only!)")
 	log.Printf("  GET  /debug/panic/nilmap           (educational only!)")
-	log.Fatal(server.ListenAndServe())
+	log.Printf("gRPC services (port %s):", cfg.GRPCPort)
+	log.Printf("  portfolio.v1.AuthService           (Register, Login)")
+	log.Printf("  portfolio.v1.PortfolioService      (GetPortfolio — JWT, self only)")
+	log.Printf("  portfolio.v1.WalletService         (ListWallets, AddWallet — JWT, self only)")
+	log.Printf("  grpc.health.v1.Health              (Check, Watch)")
 }
