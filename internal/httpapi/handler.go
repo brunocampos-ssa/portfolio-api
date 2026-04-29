@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/brunocampos-ssa/portfolio-api/internal/auth"
 	"github.com/brunocampos-ssa/portfolio-api/internal/domain"
 	"github.com/brunocampos-ssa/portfolio-api/internal/service"
 )
@@ -25,17 +26,72 @@ func NewHandler(svc *service.PortfolioService) *Handler {
 	return &Handler{service: svc}
 }
 
-// RegisterRoutes sets up all HTTP routes on the given mux.
+// RegisterRoutes registers every route this handler owns onto the given
+// mux. Kept for backwards compatibility — production wiring should prefer
+// RegisterPublicRoutes + RegisterProtectedRoutes so the JWT middleware
+// can wrap only the protected portion.
+//
+// Module 4 added auth: callers that want gating SHOULD use the split.
+// Callers that want the pre-Module-4 wide-open setup (or a test that
+// mounts everything on one mux) can keep using this method.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
+	h.RegisterPublicRoutes(mux)
+	h.RegisterProtectedRoutes(mux)
+}
+
+// RegisterPublicRoutes registers endpoints that do NOT require authentication.
+//
+// The /debug/panic endpoints intentionally trigger panics to demonstrate
+// the Recovery middleware. They stay public so students can still hit them
+// without a token; in a real product they would not exist at all.
+func (h *Handler) RegisterPublicRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /health", h.HandleHealth)
+	mux.HandleFunc("GET /debug/panic", h.HandleDebugPanic)
+	mux.HandleFunc("GET /debug/panic/nilmap", h.HandleDebugPanicNilMap)
+}
+
+// RegisterProtectedRoutes registers endpoints that REQUIRE a valid bearer
+// token AND that the token's subject matches the path-id (see requireSelf).
+//
+// Wire these onto a sub-mux and wrap with middleware.JWT in main.go.
+func (h *Handler) RegisterProtectedRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /users/{id}/portfolio", h.HandleGetPortfolio)
 	mux.HandleFunc("GET /users/{id}/wallets", h.HandleGetWallets)
 	mux.HandleFunc("POST /users/{id}/wallets", h.HandleAddWallet)
+}
 
-	// Educational/debug endpoints — intentionally trigger panics
-	// to demonstrate recovery middleware. NEVER include these in production.
-	mux.HandleFunc("GET /debug/panic", h.HandleDebugPanic)
-	mux.HandleFunc("GET /debug/panic/nilmap", h.HandleDebugPanicNilMap)
+// requireSelf enforces the rule "the JWT subject must equal the {id}
+// path parameter". It returns false (and writes a 403) when the
+// authenticated user is trying to act on someone else's data.
+//
+// This is the simplest viable authorisation policy and is what Module 4
+// teaches first. A future module can introduce role-based access (admin,
+// support) by wrapping requireSelf with an admin override.
+func (h *Handler) requireSelf(w http.ResponseWriter, r *http.Request) (string, bool) {
+	pathID := r.PathValue("id")
+	if pathID == "" {
+		writeJSON(w, http.StatusBadRequest, APIError{
+			Error: ErrorBody{Code: "invalid_input", Message: "user id is required"},
+		})
+		return "", false
+	}
+	claimSubject, ok := auth.UserIDFromContext(r.Context())
+	if !ok {
+		// Reaching here means the JWT middleware was not applied. That's
+		// a wiring bug; respond 401 rather than 500 so the client sees
+		// something coherent if they hit a misconfigured route.
+		writeJSON(w, http.StatusUnauthorized, APIError{
+			Error: ErrorBody{Code: "unauthenticated", Message: "authentication required"},
+		})
+		return "", false
+	}
+	if claimSubject != pathID {
+		writeJSON(w, http.StatusForbidden, APIError{
+			Error: ErrorBody{Code: "forbidden", Message: "you may only access your own resources"},
+		})
+		return "", false
+	}
+	return pathID, true
 }
 
 // HandleHealth returns a simple health check response.
@@ -51,11 +107,8 @@ func (h *Handler) HandleHealth(w http.ResponseWriter, r *http.Request) {
 //  3. If error → writeError maps domain error to HTTP status
 //  4. If success → write portfolio as JSON
 func (h *Handler) HandleGetPortfolio(w http.ResponseWriter, r *http.Request) {
-	userID := r.PathValue("id")
-	if userID == "" {
-		writeJSON(w, http.StatusBadRequest, APIError{
-			Error: ErrorBody{Code: "invalid_input", Message: "user id is required"},
-		})
+	userID, ok := h.requireSelf(w, r)
+	if !ok {
 		return
 	}
 
@@ -70,11 +123,8 @@ func (h *Handler) HandleGetPortfolio(w http.ResponseWriter, r *http.Request) {
 
 // HandleGetWallets handles GET /users/{id}/wallets
 func (h *Handler) HandleGetWallets(w http.ResponseWriter, r *http.Request) {
-	userID := r.PathValue("id")
-	if userID == "" {
-		writeJSON(w, http.StatusBadRequest, APIError{
-			Error: ErrorBody{Code: "invalid_input", Message: "user id is required"},
-		})
+	userID, ok := h.requireSelf(w, r)
+	if !ok {
 		return
 	}
 
@@ -100,11 +150,8 @@ type addWalletRequest struct {
 //   - Domain validation (invalid address format, unsupported blockchain)
 //   - Proper error translation to HTTP responses
 func (h *Handler) HandleAddWallet(w http.ResponseWriter, r *http.Request) {
-	userID := r.PathValue("id")
-	if userID == "" {
-		writeJSON(w, http.StatusBadRequest, APIError{
-			Error: ErrorBody{Code: "invalid_input", Message: "user id is required"},
-		})
+	userID, ok := h.requireSelf(w, r)
+	if !ok {
 		return
 	}
 

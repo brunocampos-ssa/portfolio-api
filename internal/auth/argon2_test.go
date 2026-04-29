@@ -81,13 +81,17 @@ func TestArgon2idHasher_Verify_RejectsTamperedHash(t *testing.T) {
 	encoded, err := h.Hash("hunter2")
 	require.NoError(t, err)
 
-	// Flip the last character of the hash field.
+	// Flip the FIRST character of the hash field. The first base64 char
+	// decodes to the high bits of byte 0, so a change there is guaranteed
+	// to propagate to the decoded bytes — unlike the last char, whose
+	// low bits are unused padding when the input length is not a multiple
+	// of 3 bytes.
 	parts := strings.Split(encoded, "$")
-	last := parts[5]
-	if last[len(last)-1] == 'A' {
-		parts[5] = last[:len(last)-1] + "B"
+	hash := parts[5]
+	if hash[0] == 'A' {
+		parts[5] = "B" + hash[1:]
 	} else {
-		parts[5] = last[:len(last)-1] + "A"
+		parts[5] = "A" + hash[1:]
 	}
 	tampered := strings.Join(parts, "$")
 
