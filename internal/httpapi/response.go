@@ -85,6 +85,12 @@ func mapCodeToHTTPStatus(code domain.ErrorCode) int {
 		return http.StatusBadRequest // 400
 	case domain.CodeUnsupportedNetwork:
 		return http.StatusBadRequest // 400
+	case domain.CodeUnauthenticated:
+		return http.StatusUnauthorized // 401
+	case domain.CodeForbidden:
+		return http.StatusForbidden // 403
+	case domain.CodeConflict:
+		return http.StatusConflict // 409
 	case domain.CodeProviderFailure:
 		return http.StatusBadGateway // 502
 	case domain.CodeUpstreamTimeout:
