@@ -1,0 +1,42 @@
+// PortfolioService — read user portfolios.
+//
+// Mirror of GET /users/{id}/portfolio. The same self-only access policy
+// applies: the JWT subject must equal user_id.
+syntax = "proto3";
+
+package portfolio.v1;
+
+option go_package = "github.com/brunocampos-ssa/portfolio-api/gen/portfolio/v1;portfoliov1";
+
+service PortfolioService {
+  // GetPortfolio returns aggregated holdings + USD totals for a user.
+  rpc GetPortfolio(GetPortfolioRequest) returns (GetPortfolioResponse);
+}
+
+message GetPortfolioRequest {
+  // The user whose portfolio is requested. Must match the authenticated
+  // subject — the server enforces self-only access.
+  string user_id = 1;
+}
+
+message GetPortfolioResponse {
+  string user_id = 1;
+  string user_name = 2;
+  repeated Holding holdings = 3;
+  double total_usd = 4;
+}
+
+// Holding mirrors domain.Holding. We keep the proto and Go structs
+// independent — the gRPC server translates between them — so changes
+// to the domain don't force a wire-protocol change.
+message Holding {
+  string blockchain = 1;
+  string address = 2;
+  string asset = 3;
+  double balance = 4;
+  double price_usd = 5;
+  double value_usd = 6;
+  // error is set on partial failure: a single wallet's balance/price
+  // fetch may have failed without taking down the whole portfolio.
+  string error = 7;
+}

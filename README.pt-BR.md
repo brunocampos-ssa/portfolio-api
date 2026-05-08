@@ -1,19 +1,26 @@
-# Portfolio API -- Modulos 2 e 3: Concorrencia Avancada + Testes Profissionais em Go
+# Portfolio API -- Modulos 2, 3 e 4: Concorrencia + Testes + Auth & gRPC em Go
 
 > [Read in English](README.md)
 
-Material de aula que cobre duas etapas consecutivas do curso avancado de Go:
+Material de aula que cobre tres etapas consecutivas do curso avancado de Go:
 
 - **Modulo 2 -- Concorrencia Avancada (5h):** o projeto ganhou dois novos
   binarios (`event-watcher` e `snapshot-runner`) que resolvem problemas
   naturalmente concorrentes: monitoramento de eventos blockchain em tempo
   real e geracao de snapshots de saldo para simulacao de relatorio fiscal.
 
-- **Modulo 3 -- Testes Profissionais:** em cima do codigo do Modulo 2, foi
+- **Modulo 3 -- Testes Profissionais (3h):** em cima do codigo do Modulo 2, foi
   adicionada uma camada completa de testes: unitarios, com mocks (`testify/mock`),
   de concorrencia (com `-race`), de integracao (Postgres + Anvil via
   `testcontainers-go`), benchmarks e profiling com `pprof`. Os executaveis do
   Modulo 2 permanecem intactos -- a evolucao foi **aditiva**.
+
+- **Modulo 4 Aula 1 -- JWT + gRPC (3h):** autenticacao com argon2id +
+  access tokens (JWT HS256) + refresh tokens com rotacao e deteccao de
+  replay. Espelhamento da API REST em gRPC com o **mesmo nucleo de auth**
+  servindo aos dois transportes. Aula 2 cobrira observabilidade e
+  resiliencia da camada de auth. Detalhes completos abaixo na secao
+  "Modulo 4 -- Aula 1".
 
 > **Pre-requisito**: Modulo 1 (Tratamento de Erros, Panic/Recover, Programacao Defensiva).
 > Os conceitos de `errors.Is`, `AppError`, `panic`/`recover` e falha parcial
@@ -1446,6 +1453,35 @@ test/
 └── integration/                    # testes ponta a ponta (tag `integration`)
 ```
 
+Modulo 4 Aula 1 adicionou:
+
+```
+internal/
+├── auth/                                 # NOVO (Modulo 4)
+│   ├── argon2.go                         # hasher argon2id em formato PHC
+│   ├── argon2_test.go
+│   ├── jwt.go                            # TokenIssuer/TokenVerifier HS256
+│   └── jwt_test.go
+├── grpcapi/                              # NOVO (Modulo 4)
+│   ├── auth_interceptor.go               # interceptor unario JWT
+│   ├── errors.go                         # AppError -> grpc/codes
+│   ├── peer.go                           # user-agent + IP do peer
+│   └── server.go                         # AuthServer/PortfolioServer/WalletServer
+├── middleware/jwt.go                     # NOVO -- middleware HTTP de JWT
+├── repository/postgres/refresh_token_repository.go  # NOVO
+└── service/auth_service.go               # NOVO -- Register/Login/Refresh/Logout
+
+proto/portfolio/v1/                       # NOVO -- *.proto
+gen/portfolio/v1/                         # NOVO -- codigo gerado pelo buf
+examples/restclient/main.go               # NOVO -- demo REST end-to-end
+examples/grpcclient/main.go               # NOVO -- demo gRPC end-to-end
+buf.yaml, buf.gen.yaml                    # NOVO -- toolchain de protobuf
+migrations/005_add_user_auth.up.sql       # NOVO -- password_hash + refresh_tokens
+test/integration/auth_helper_test.go      # NOVO
+test/integration/auth_http_test.go        # NOVO -- happy + replay + cross-account
+test/integration/auth_grpc_test.go        # NOVO -- inclui teste cross-transport
+```
+
 Novos `_test.go` foram plantados junto aos arquivos que testam, sem mexer
 no codigo de producao.
 
@@ -1477,6 +1513,631 @@ no codigo de producao.
 - O `-race` aumenta consideravelmente o tempo de execucao (~2-10x).
   Em CI, rode o pipeline unitario completo com `-race` e o pipeline
   de integracao **sem** `-race` para velocidade.
+
+---
+
+## Modulo 4 -- Aula 1: Autenticacao JWT + Espelhamento gRPC
+
+Esta secao documenta a **camada de autenticacao** adicionada em cima
+do codigo dos Modulos 2 e 3, e a exposicao da mesma API por **dois
+transportes**: REST (que ja existia) e gRPC. O objetivo pedagogico nao
+e duplicar o servico: e mostrar que, quando o nucleo de autenticacao e
+desenhado corretamente, adicionar um segundo transporte nao multiplica
+a superficie de seguranca -- o mesmo `auth.TokenVerifier` serve aos
+dois lados.
+
+### 6.1 Objetivos de Aprendizagem
+
+Ao final deste modulo voce sabera:
+
+- Hashar senhas com **argon2id** (memoria-dura, recomendado pela OWASP)
+  e armazenar o resultado no formato PHC string padrao.
+- Emitir e verificar **JWT** com `golang-jwt/jwt/v5`, pinando o
+  algoritmo (HS256) e o issuer para evitar as classicas armadilhas de
+  `alg: none` e issuer-confusion.
+- Diferenciar os dois propositos de token: access (JWT, sem estado,
+  curta vida) e refresh (opaco, com estado, longa vida).
+- Implementar **rotacao de refresh tokens** com uma cadeia
+  `replaced_by` e detectar replay revogando a familia inteira.
+- Escrever uma migration que adiciona o esquema sem quebrar dados ja
+  existentes (default `''`, `lower(email)` como indice unico,
+  `refresh_tokens` com auditoria).
+- Compor um middleware HTTP de autenticacao com a stack existente
+  (RequestID -> Logging -> Recovery -> JWT -> handlers).
+- Escrever **arquivos `.proto`**, configurar `buf` para gerar codigo Go,
+  e implementar os servidores gRPC sem reescrever a logica de negocio.
+- Aplicar a mesma politica de auth em gRPC via **interceptor unario**,
+  usando o mesmo `TokenVerifier`.
+- Mapear `domain.AppError` para HTTP status **e** `grpc/codes.Code` em
+  uma unica tabela canonica.
+
+### 6.2 Por que dois tokens?
+
+A pergunta surge naturalmente: se temos JWT, por que precisamos de
+refresh tokens? Por que nao um JWT longo?
+
+Resposta curta: **revogacao**. Um JWT e stateless por design -- o
+servidor so precisa da chave para verificar. Isso e otimo para
+performance, mas significa que **nao da para invalidar um JWT antes
+da expiracao**. Se um token vazar, o atacante o usa ate o `exp`
+estourar.
+
+A solucao classica e dois tokens:
+
+```
++----------------+              +-----------------+
+| Access token   |              | Refresh token   |
+| (JWT, HS256)   |              | (opaco, 32B)    |
+| 15 minutos     |              | 30 dias         |
+| sem estado     |              | com estado (DB) |
+| revogavel? NAO |              | revogavel? SIM  |
++----------------+              +-----------------+
+       |                                |
+       |  request                       |  /auth/refresh
+       v                                v
+   API verifica            DB busca, valida, ROTACIONA
+```
+
+- **Access token** vive nos headers de cada request. Curto justamente
+  porque nao da para revogar antes da expiracao.
+- **Refresh token** vive numa tabela do banco (hashed). Cada
+  `/auth/refresh` invalida o anterior e emite um novo, fechando a
+  janela de exposicao.
+
+Se um access token vaza, o atacante tem ate 15 minutos. Se um refresh
+token vaza, o ataque e detectavel: na proxima vez que o usuario
+legitimo refrescar, o token "antigo" do atacante ja sera invalido --
+ou o nosso modelo detecta replay e revoga a familia inteira (ver 6.5.3).
+
+### 6.3 Migration 005: novo esquema, sem quebrar o antigo
+
+```sql
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT NOT NULL DEFAULT '';
+CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_uq ON users (lower(email));
+```
+
+**Por que `DEFAULT ''`?** Porque os usuarios seedados em `002_seed_data`
+(u1, u2, u3) ja existiam quando rodamos a migration. Sem o default, o
+`ALTER TABLE ADD COLUMN NOT NULL` falharia. Com `''`, eles ficam com hash
+vazio -- nao conseguem logar (a comparacao falha), mas existem para os
+testes que ja exercitam `/users/{id}/...`. O testenv re-popula com um
+hash valido para os testes que precisam.
+
+**Por que `lower(email)`?** Usuarios digitam "Vitalik@Example.com" e
+"vitalik@example.com" e esperam que **colidam**. Um indice funcional
+em `lower(email)` resolve isso sem mutar o input do usuario (que
+preserva o caso original). O repositorio faz `lower($1)` no `WHERE`
+da consulta para usar o indice.
+
+```sql
+CREATE TABLE IF NOT EXISTS refresh_tokens (
+    id          TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash  TEXT NOT NULL,
+    issued_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at  TIMESTAMPTZ NOT NULL,
+    revoked_at  TIMESTAMPTZ,
+    replaced_by TEXT REFERENCES refresh_tokens(id),
+    user_agent  TEXT,
+    ip          INET
+);
+CREATE UNIQUE INDEX refresh_tokens_token_hash_uq ON refresh_tokens (token_hash);
+CREATE INDEX        refresh_tokens_user_id_idx     ON refresh_tokens (user_id);
+```
+
+Pontos de discussao em sala:
+
+- **Por que `token_hash` e nao o token plain?** Mesma razao de senhas:
+  se o banco vazar, o atacante nao recebe tokens utilizaveis. Diferente
+  de senha porque o input ja tem 256 bits de entropia, entao `SHA-256`
+  e suficiente -- nao precisamos de argon2 para refrescar tokens.
+- **Por que `replaced_by` aponta para a "proxima"?** Porque a deteccao
+  de replay precisa caminhar a cadeia. Quando alguem apresenta um
+  token cujo `replaced_by IS NOT NULL`, sabemos que ele ja foi
+  rotacionado -- e tratamos como compromisso (ver 6.5.3).
+- **`ON DELETE CASCADE`** garante que apagar um usuario apaga seus
+  refresh tokens. Diferente do que faziamos para wallets, aqui o
+  cascade e correto -- nao queremos refresh tokens orfaos.
+
+### 6.4 Pacote `internal/auth`
+
+Mantemos a logica criptografica isolada do servico. Duas estruturas:
+
+#### 6.4.1 `Argon2idHasher` -- hashing de senhas
+
+argon2id e a funcao recomendada pela OWASP em 2024. E **memory-hard**:
+quebrar requer tanto CPU quanto RAM, defesa contra GPUs/ASICs que
+dominam contra bcrypt.
+
+Tres parametros tunaveis:
+
+```
+m (memoria)     -- KiB de RAM alocados durante o hash
+t (time)        -- numero de passes sobre a memoria (custo linear)
+p (parallelism) -- threads (custo paralelo)
+```
+
+Defaults: `m=65536` (64 MiB), `t=3`, `p=2`. Tunados para ~50-150 ms
+por verify num laptop -- confortavel para login interativo, doloroso
+para um atacante moendo bilhoes de tentativas.
+
+Armazenamos o hash no formato **PHC string** padrao
+(github.com/P-H-C/phc-string-format):
+
+```
+$argon2id$v=19$m=65536,t=3,p=2$<salt-base64>$<hash-base64>
+```
+
+O formato carrega os parametros junto com o hash. Isso significa que:
+
+1. Podemos rotacionar parametros (m=128MiB no futuro) sem quebrar usuarios antigos -- o `Verify` le os parametros do proprio hash.
+2. Outros idiomas (Python, Rust) podem ler nossos hashes -- o formato e compartilhado.
+
+```go
+hasher := auth.NewArgon2idHasher()
+
+encoded, err := hasher.Hash("correct-horse-battery")
+// $argon2id$v=19$m=65536,t=3,p=2$T4...salt...==$1f...key...
+
+ok, err := hasher.Verify(encoded, "correct-horse-battery")
+// true
+```
+
+Comparacao de constante (`subtle.ConstantTimeCompare`) protege contra
+ataques de timing -- a duracao de `Verify` nao depende de **onde** o
+hash diverge.
+
+#### 6.4.2 `TokenIssuer` / `TokenVerifier` -- JWT HS256
+
+```go
+issuer := auth.NewTokenIssuer(signingKey, 15*time.Minute)
+token, expiresAt, err := issuer.Issue("u-42")
+
+verifier := auth.NewTokenVerifier(signingKey)
+claims, err := verifier.Verify(token)
+// claims.Subject == "u-42"
+```
+
+Tres armadilhas classicas que o `Verify` evita explicitamente:
+
+1. **`alg: none`**. Um atacante poderia montar um JWT com header
+   `{"alg":"none"}` e nenhuma assinatura. Pinamos `HS256` na keyfunc:
+   se o algoritmo nao e HMAC, rejeitamos antes mesmo de verificar.
+2. **issuer confusion**. Se voce so verifica a assinatura, um JWT
+   emitido por outro servico (mas que compartilha a chave por
+   acidente -- acontece) seria aceito. Adicionamos
+   `jwt.WithIssuer(Issuer)`.
+3. **exp opcional**. Um JWT sem `exp` viveria para sempre.
+   `jwt.WithExpirationRequired()` recusa.
+
+Todas as falhas de `Verify` colapsam em **um unico erro**
+(`ErrInvalidToken`). Isso nao e descuido -- e proposital. Se a API
+respondesse "expired" vs "bad signature" vs "wrong issuer", o
+atacante usaria essa diferenca para sondar. **Uma so resposta para
+todas as falhas de auth** e a regra geral.
+
+### 6.5 Os dois tokens em acao
+
+#### 6.5.1 Access token (JWT, stateless)
+
+Emitido em `Login` e em cada `Refresh`. Vive em `Authorization: Bearer
+<token>` em cada request. **Nao guardamos copia** -- o servidor confia
+na assinatura.
+
+#### 6.5.2 Refresh token (opaco, com estado)
+
+Emitido junto com o access. **32 bytes aleatorios** em base64url, sem
+padding. Guardamos `SHA-256(token)` em hex no banco. O cliente recebe
+o plain text **uma unica vez** -- se perder, faz login de novo.
+
+#### 6.5.3 Rotacao + deteccao de replay
+
+```
+estado inicial:
+  refresh_tokens
+  +------+--------+-----------+------------+-------------+
+  | id   | user   | hash      | revoked_at | replaced_by |
+  +------+--------+-----------+------------+-------------+
+  | rt-1 | alice  | h(A)      |   NULL     |   NULL      |  <-- ativo
+  +------+--------+-----------+------------+-------------+
+
+cliente apresenta A em /auth/refresh:
+  - busca por h(A): encontra rt-1
+  - rt-1.revoked_at = NULL? OK, ativo
+  - emite novo par (B + access)
+  - INSERT rt-2 com h(B)
+  - UPDATE rt-1 SET revoked_at = NOW(), replaced_by = 'rt-2'
+
+  +------+--------+-----------+------------+-------------+
+  | rt-1 | alice  | h(A)      | 2026-04-29 |   rt-2      |  <-- rotacionado
+  | rt-2 | alice  | h(B)      |   NULL     |   NULL      |  <-- ativo
+  +------+--------+-----------+------------+-------------+
+```
+
+Caso normal: o cliente legitimo agora tem B. Ele apresenta B na
+proxima vez. A foi revogado.
+
+**E se A aparecer de novo?**
+
+Duas possibilidades:
+
+- **(a)** O cliente legitimo replicou A por um bug (clock skew,
+  retry sem rotacionar do lado dele).
+- **(b)** Um atacante interceptou A antes da rotacao. O cliente
+  legitimo seguiu adiante para B. Agora o atacante tenta usar A.
+
+Nao da para distinguir (a) de (b) so olhando para o pedido. O modelo
+escolhe a postura mais defensiva: **trata como compromisso e revoga a
+familia inteira**.
+
+```
+cliente apresenta A novamente:
+  - busca por h(A): encontra rt-1
+  - rt-1.revoked_at != NULL  -->  REPLAY DETECTADO
+  - RevokeFamily(rt-1.id): caminha replaced_by para frente
+                           e replaced_by-volta para tras,
+                           revoga tudo em uma volta ao banco
+
+  +------+--------+-----------+------------+-------------+
+  | rt-1 | alice  | h(A)      | (intacto)  |   rt-2      |  <-- ja revogado
+  | rt-2 | alice  | h(B)      | 2026-04-29 |   NULL      |  <-- agora revogado!
+  +------+--------+-----------+------------+-------------+
+  - retorna 401 / Unauthenticated
+```
+
+O usuario legitimo, da proxima vez que tentar refresh com B, recebe
+401 e tem que logar de novo. Custo: uma sessao perdida. Beneficio: se
+era um ataque real, o atacante perdeu acesso na hora.
+
+A logica completa esta em
+`service.AuthService.Refresh`. O CTE recursivo que caminha a cadeia
+em ambas direcoes esta em
+`postgres.RefreshTokenRepository.RevokeFamily`.
+
+### 6.6 Endpoints REST
+
+```
+POST /auth/register   { name, email, password }              -> 201 + user
+POST /auth/login      { email, password }                    -> 200 + tokens
+POST /auth/refresh    { refresh_token }                      -> 200 + tokens
+POST /auth/logout     { refresh_token }                      -> 204
+```
+
+Pontos de discussao:
+
+- **Por que nao cookies?** Porque queremos que clientes mobile e o
+  mirror gRPC tratem tokens da mesma forma. Cookies sao um caminho
+  feliz pra browser, mas adicionam complexidade (CSRF, SameSite, secure
+  flag). Optamos por entregar no body e deixar o cliente decidir como
+  guardar -- localStorage (vulneravel a XSS) vs IndexedDB vs HttpOnly
+  cookie via gateway -- e uma decisao do cliente.
+- **Register nao retorna token**. OWASP recomenda: o caminho de auth
+  deve ser exercitado em **toda** entrada. Se Register tambem logasse,
+  bugs em Login passariam despercebidos.
+- **Logout retorna 204** e **e idempotente**. Se voce manda um
+  `refresh_token` que nao existe, retornamos 204 igual. Nao queremos
+  dar a um atacante o "sim, esse token existe" como side channel.
+
+### 6.7 Middleware JWT
+
+`internal/middleware/jwt.go` segue exatamente o padrao do RequestID:
+
+```go
+func JWT(verifier *auth.TokenVerifier) func(http.Handler) http.Handler {
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            token, ok := bearerToken(r.Header.Get("Authorization"))
+            if !ok {
+                writeJSONUnauthorized(w, "missing or malformed Authorization header")
+                return
+            }
+            claims, err := verifier.Verify(token)
+            if err != nil {
+                writeJSONUnauthorized(w, "invalid or expired token")
+                return
+            }
+            ctx := auth.WithClaims(r.Context(), claims)
+            next.ServeHTTP(w, r.WithContext(ctx))
+        })
+    }
+}
+```
+
+Em `cmd/api/main.go` montamos **dois muxes**:
+
+```go
+publicMux := http.NewServeMux()      // /health, /auth/*, /debug/*
+authHandler.RegisterRoutes(publicMux)
+apiHandler.RegisterPublicRoutes(publicMux)
+
+protectedMux := http.NewServeMux()   // /users/{id}/*
+apiHandler.RegisterProtectedRoutes(protectedMux)
+
+rootMux := http.NewServeMux()
+rootMux.Handle("/users/", middleware.JWT(verifier)(protectedMux))
+rootMux.Handle("/", publicMux)
+```
+
+A vantagem pedagogica: adicionar uma nova rota protegida e uma chamada
+em `protectedMux` -- ela herda autenticacao automaticamente.
+
+### 6.8 "JWT subject == path id"
+
+Authentication e Authorization sao coisas diferentes. O middleware
+JWT prova **quem voce e**. Para decidir **se voce pode** ler
+`/users/{id}/portfolio`, comparamos:
+
+```go
+func (h *Handler) requireSelf(w http.ResponseWriter, r *http.Request) (string, bool) {
+    pathID := r.PathValue("id")
+    claims, ok := auth.ClaimsFromContext(r.Context())
+    if !ok {
+        write401(w)         // bug de wiring -- middleware nao foi aplicado
+        return "", false
+    }
+    if claims.Subject != pathID {
+        write403(w)         // alice tentando ler /users/bob/...
+        return "", false
+    }
+    return pathID, true
+}
+```
+
+Esta e a politica de autorizacao mais simples possivel -- "self only".
+Modulo 4 Aula 2 abrira espaco para roles (admin, support).
+
+### 6.9 Espelhando a API em gRPC
+
+#### 6.9.1 Proto-first
+
+`proto/portfolio/v1/auth.proto`, `portfolio.proto`, `wallet.proto`.
+O `option go_package = "...gen/portfolio/v1;portfoliov1"` indica para
+onde buf gera o codigo Go.
+
+#### 6.9.2 buf como toolchain
+
+```yaml
+# buf.yaml
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+breaking:
+  use:
+    - FILE
+```
+
+```yaml
+# buf.gen.yaml
+version: v2
+managed:
+  enabled: true
+plugins:
+  - local: protoc-gen-go
+    out: gen
+    opt: [paths=source_relative]
+  - local: protoc-gen-go-grpc
+    out: gen
+    opt: [paths=source_relative]
+```
+
+```bash
+make proto-tools   # uma vez: instala buf + plugins em $GOPATH/bin
+make proto         # gera gen/portfolio/v1/*.pb.go
+```
+
+Comitamos `gen/` no repositorio para que CI / alunos nao precisem
+instalar buf so para construir o projeto.
+
+#### 6.9.3 Servidor + interceptor
+
+`internal/grpcapi/server.go` implementa as interfaces `*Server`
+geradas. Cada RPC e fino: adapta o request proto para a entrada do
+servico, chama o servico existente, traduz o erro.
+
+`internal/grpcapi/auth_interceptor.go` tem o mesmo papel do middleware
+HTTP, em forma gRPC:
+
+```go
+func UnaryAuthInterceptor(verifier *auth.TokenVerifier) grpc.UnaryServerInterceptor {
+    return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+        if _, ok := publicMethods[info.FullMethod]; ok {
+            return handler(ctx, req)              // Register, Login, Health bypassam
+        }
+        token, ok := bearerFromMetadata(ctx)
+        if !ok {
+            return nil, status.Error(codes.Unauthenticated, "...")
+        }
+        claims, err := verifier.Verify(token)
+        if err != nil {
+            return nil, status.Error(codes.Unauthenticated, "...")
+        }
+        return handler(auth.WithClaims(ctx, claims), req)
+    }
+}
+```
+
+Note: **mesmo `auth.TokenVerifier`** usado pelo middleware HTTP. Esse e
+o ponto pedagogico central. O metadado gRPC e `authorization: Bearer
+<token>` (lowercase), simetrico ao header HTTP.
+
+#### 6.9.4 Health check
+
+Registramos o servico padrao `grpc.health.v1.Health` para que
+load-balancers e Kubernetes possam fazer probe. Tambem habilitamos
+`reflection` -- assim `grpcurl` funciona sem precisar dos `.proto`.
+
+#### 6.9.5 Servidor unico, dois transportes
+
+```go
+// HTTP
+go func() { httpServer.ListenAndServe() }()
+
+// gRPC
+go func() { grpcServer.Serve(grpcLis) }()
+
+// SIGTERM dispara desligamento ordenado em ambos
+<-stopCtx.Done()
+httpServer.Shutdown(ctxBudget)
+grpcServer.GracefulStop()
+```
+
+Stdlib only, sem `errgroup`. O Modulo 2 ja ensinou
+`sync.WaitGroup` e canais -- usamos exatamente esse vocabulario aqui.
+
+### 6.10 Tabela canonica de erros
+
+| Codigo de dominio   | HTTP                  | gRPC                  |
+|---------------------|-----------------------|-----------------------|
+| `not_found`         | 404 Not Found         | NotFound              |
+| `validation_error`  | 400 Bad Request       | InvalidArgument       |
+| `invalid_input`     | 400 Bad Request       | InvalidArgument       |
+| `unauthenticated`   | 401 Unauthorized      | Unauthenticated       |
+| `forbidden`         | 403 Forbidden         | PermissionDenied      |
+| `conflict`          | 409 Conflict          | AlreadyExists         |
+| `provider_failure`  | 502 Bad Gateway       | Unavailable           |
+| `upstream_timeout`  | 504 Gateway Timeout   | DeadlineExceeded      |
+| `internal_error`    | 500                   | Internal              |
+
+`internal/httpapi/response.go` (REST) e `internal/grpcapi/errors.go`
+(gRPC) compartilham essa tabela linha por linha. Ao adicionar um codigo
+novo: adicione em **dois** switches.
+
+### 6.11 Clientes de exemplo
+
+#### REST -- `examples/restclient`
+
+Roda o ciclo completo: register -> login -> get portfolio -> refresh
+-> get portfolio (com token rotacionado) -> logout. **So usa stdlib**.
+
+```bash
+make run                            # numa aba
+go run ./examples/restclient        # noutra
+```
+
+Saida tipica:
+
+```
+==> Using base URL: http://localhost:8080
+    registered or already-existed: id=u_b1... email=alice-restclient@example.com
+==> login OK
+    access_token expires at  2026-04-29T13:15:42Z
+    refresh_token expires at 2026-05-29T13:00:42Z
+==> GET /users/{id}/portfolio (with access token)
+    response: {"user_id":"u_b1...", ...}
+==> refresh OK -- got new pair (rotation chain advanced)
+    old refresh token is now revoked
+==> GET /users/{id}/portfolio (with rotated access token)
+==> logout OK
+```
+
+#### gRPC -- `examples/grpcclient`
+
+Mesmo ciclo (sem refresh/logout, que sao REST-only no Aula 1):
+
+```bash
+go run ./examples/grpcclient
+```
+
+Demonstra `metadata.AppendToOutgoingContext(ctx, "authorization",
+"Bearer <token>")` -- o equivalente gRPC do header HTTP. O **mesmo
+access_token** funciona nos dois transportes.
+
+#### Por curl
+
+```bash
+TOKEN=$(curl -s -X POST localhost:8080/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"alice@example.com","password":"correct-horse-battery"}' \
+  | jq -r .access_token)
+
+curl -H "Authorization: Bearer $TOKEN" \
+  localhost:8080/users/<user_id>/portfolio
+```
+
+#### Por grpcurl
+
+```bash
+grpcurl -plaintext -d '{"email":"alice@example.com","password":"correct-horse-battery"}' \
+  localhost:50051 portfolio.v1.AuthService/Login
+
+grpcurl -plaintext \
+  -H "authorization: Bearer $TOKEN" \
+  -d '{"user_id":"<id>"}' \
+  localhost:50051 portfolio.v1.PortfolioService/GetPortfolio
+```
+
+`grpcurl` usa server reflection (que habilitamos) -- nao precisa dos
+`.proto`.
+
+### 6.12 Testes -- a piramide, agora atravessando dois transportes
+
+Mantemos a mesma estrutura do Modulo 3, expandida:
+
+- **Unidade**: `internal/auth/argon2_test.go`, `jwt_test.go`,
+  `service/auth_service_test.go` -- argon2 round-trip, JWT
+  expirado/tampered/wrong-key, login com senha errada, refresh com
+  rotacao + replay, logout idempotente. Mocks via `testify/mock`
+  (compartilhado com o Modulo 3).
+- **Middleware**: `internal/middleware/jwt_test.go` -- header malformado,
+  bearer case-insensitive, token expirado, panic em `JWT(nil)`.
+- **Handler HTTP**: `internal/httpapi/handler_test.go` -- requireSelf
+  bloqueia cross-account com 403 e 401 quando claims faltam.
+- **Integracao** (build tag `integration`):
+  - `test/integration/auth_http_test.go` -- happy path completo,
+    deteccao de replay revogando a familia, cross-account 403, login
+    com senha errada e email inexistente produzindo respostas
+    **identicas** byte a byte (sem oracle).
+  - `test/integration/auth_grpc_test.go` -- mesmo cenario via
+    `grpc.Dial` em porta real (nao bufconn), inclui o teste
+    headline: **token emitido por gRPC funciona em REST**.
+
+```bash
+make test-unit          # rapido, sem Docker
+make test-integration   # com Docker, valida REST e gRPC fim a fim
+```
+
+### 6.13 Para a Aula 2
+
+Aula 1 deliberadamente deixou tres temas em aberto, que formarao um
+arco coeso para a Aula 2:
+
+1. **Refresh + Logout em gRPC**. Hoje sao REST only. A versao gRPC vai
+   exigir que os interceptors saibam diferenciar metodos publicos e
+   protegidos -- e eles ja sabem -- e o servico extender o
+   `AuthServiceServer` com dois RPCs. Discutiremos por que faz sentido
+   ter o mesmo servico em dois transportes.
+2. **Observabilidade da auth**. Migrar de `log.Printf` para `slog`
+   estruturado. Adicionar um log de auditoria por evento de auth
+   (login OK, login fail, refresh, logout, replay detected). No gRPC,
+   adicionar um interceptor de tracing (OpenTelemetry).
+3. **Resiliencia**. Rate-limit em `/auth/login` para frear ataques de
+   forca bruta. Block list de tokens conhecidos comprometidos
+   (denylist por `jti`).
+
+### 6.14 Fluxo Sugerido para a Aula
+
+1. **Conceitos (~15 min)** -- abrir 6.2/6.5 no quadro. Discutir por
+   que dois tokens, e desenhar o fluxograma da rotacao + replay.
+2. **argon2id (~15 min)** -- abrir `internal/auth/argon2.go`,
+   passar pelo formato PHC. Discutir por que **nao** bcrypt (memory
+   hardness vs GPU-friendliness).
+3. **JWT (~15 min)** -- abrir `jwt.go`. Os tres pinning (algoritmo,
+   issuer, exp). Mostrar `TestTokenVerifier_Verify_RejectsAlgNone`.
+4. **Migration + repos (~10 min)** -- abrir `005_add_user_auth.up.sql`
+   e `refresh_token_repository.go`. Destacar `RevokeFamily` com o CTE
+   recursivo bidirecional.
+5. **Servico (~25 min)** -- abrir `service/auth_service.go`. Caminhar
+   `Login` (constant timing!), `Refresh` (rotacao + replay).
+6. **Middleware + handler REST (~15 min)** -- mostrar o two-mux split
+   em `cmd/api/main.go`. Rodar `examples/restclient` ao vivo.
+7. **gRPC (~25 min)** -- abrir os `.proto`, rodar `make proto`,
+   passar pelo interceptor e server.go. Rodar `examples/grpcclient`
+   ao vivo. Demo final: o **mesmo token funciona nos dois lados**.
+8. **Testes (~10 min)** -- abrir `auth_http_test.go` e `auth_grpc_test.go`.
+   Mostrar como o teste de cross-transport amarra o final da aula.
 
 ---
 

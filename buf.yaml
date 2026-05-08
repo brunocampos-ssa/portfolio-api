@@ -1,0 +1,23 @@
+# buf.yaml — buf module configuration.
+#
+# Module 4 introduces protobuf to the project for the gRPC mirror of the
+# REST API. We use buf (rather than raw protoc) because:
+#
+#   * Single tool to install — no protoc + plugins dance.
+#   * Built-in linter (`buf lint`) catches naming / package layout mistakes.
+#   * `buf generate` invokes the language plugins via the config in buf.gen.yaml.
+#
+# The proto sources live under proto/. The generated Go code lands in gen/.
+version: v2
+
+modules:
+  - path: proto
+
+# Lint defaults to the curated DEFAULT category. See buf docs.
+lint:
+  use:
+    - STANDARD
+
+breaking:
+  use:
+    - FILE

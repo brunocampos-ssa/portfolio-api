@@ -3,7 +3,8 @@
         test test-unit test-integration test-race \
         bench bench-cpu bench-mem \
         profile profile-cpu profile-mem \
-        cover tidy
+        cover tidy \
+        proto proto-tools
 
 # =============================================================================
 # Run targets — start one of the three executables locally.
@@ -130,3 +131,26 @@ cover:
 
 tidy:
 	go mod tidy
+
+# =============================================================================
+# Protobuf / gRPC codegen.
+#
+# Module 4 introduces a gRPC mirror of the REST API. Sources live in
+# proto/, generated Go lands in gen/, and we commit the output so users
+# can build the project without installing buf.
+#
+# `make proto-tools` installs the codegen toolchain into $GOPATH/bin.
+# `make proto` regenerates Go from the .proto sources. Run it whenever
+# you edit anything under proto/.
+# =============================================================================
+
+proto-tools:
+	go install github.com/bufbuild/buf/cmd/buf@latest
+	go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+
+proto:
+	@command -v buf >/dev/null 2>&1 || { echo "buf not on PATH — run 'make proto-tools' first"; exit 1; }
+	buf lint
+	buf generate
+	@echo "Generated code regenerated under gen/"

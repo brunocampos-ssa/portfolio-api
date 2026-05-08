@@ -3,6 +3,7 @@ package contracts
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	"github.com/brunocampos-ssa/portfolio-api/internal/domain"
 )
@@ -12,8 +13,51 @@ import (
 // =============================================================================
 
 // UserRepository defines how user data is loaded from persistence.
+//
+// Module 4 grew this interface from a single FindByID lookup into a real
+// CRUD surface so the auth service can register users and authenticate
+// them by email.
 type UserRepository interface {
 	FindByID(ctx context.Context, id string) (*domain.User, error)
+	FindByEmail(ctx context.Context, email string) (*domain.User, error)
+	Create(ctx context.Context, user *domain.User, passwordHash string) error
+}
+
+// RefreshTokenRepository persists issued refresh tokens. Tokens are stored
+// only as their SHA-256 hash; the plaintext is shown to the client once
+// at issuance and never recovered.
+type RefreshTokenRepository interface {
+	// Insert records a freshly issued refresh token.
+	Insert(ctx context.Context, token *domain.RefreshToken) error
+
+	// FindByHash loads a token by its SHA-256 hash. Returns
+	// domain.ErrRefreshTokenNotFound when no row matches.
+	FindByHash(ctx context.Context, tokenHash string) (*domain.RefreshToken, error)
+
+	// Rotate atomically inserts newToken AND marks oldID revoked + linked
+	// to newToken.ID via replaced_by, in a single DB transaction guarded by
+	// SELECT ... FOR UPDATE on the old row. This serialises concurrent
+	// refresh attempts of the same token: only one rotation wins; the
+	// loser sees the old row already revoked and gets back
+	// domain.ErrRefreshTokenRevoked, which the caller treats as replay
+	// (revoke the family, force re-auth).
+	//
+	// This replaces the old "Insert then MarkRotated" two-step flow which
+	// was vulnerable to a race that left an orphan refresh token: two
+	// concurrent refreshes could both pass the freshness check, both
+	// insert their own new token, and both UPDATE the old row — leaving
+	// the loser's new token valid but unreferenced by replaced_by.
+	Rotate(ctx context.Context, oldID string, newToken *domain.RefreshToken, revokedAt time.Time) error
+
+	// Revoke marks a single token revoked. Idempotent — revoking an
+	// already-revoked token is a no-op.
+	Revoke(ctx context.Context, id string, revokedAt time.Time) error
+
+	// RevokeFamily revokes the entire chain reachable via replaced_by from
+	// the given starting token. Used when a replay is detected: revoking
+	// the chain forces every device that holds any token in the lineage
+	// to re-authenticate.
+	RevokeFamily(ctx context.Context, startID string, revokedAt time.Time) error
 }
 
 // WalletRepository defines how wallet data is loaded from persistence.

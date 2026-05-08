@@ -36,6 +36,37 @@ var (
 
 	// ErrUpstreamTimeout indicates an external call exceeded its deadline.
 	ErrUpstreamTimeout = errors.New("upstream timeout")
+
+	// ErrInvalidCredentials indicates the supplied email/password pair did
+	// not match an active account. Deliberately collapses "no such email"
+	// and "wrong password" into one error so an attacker cannot enumerate
+	// accounts by observing different responses.
+	ErrInvalidCredentials = errors.New("invalid credentials")
+
+	// ErrUserAlreadyExists indicates a registration attempt for an email
+	// that is already in use (case-insensitive).
+	ErrUserAlreadyExists = errors.New("user already exists")
+
+	// ErrUnauthenticated indicates the caller did not present a valid
+	// access token. Maps to HTTP 401 / gRPC Unauthenticated.
+	ErrUnauthenticated = errors.New("unauthenticated")
+
+	// ErrForbidden indicates the caller is authenticated but not allowed
+	// to access this specific resource. Maps to HTTP 403 / gRPC PermissionDenied.
+	ErrForbidden = errors.New("forbidden")
+
+	// ErrRefreshTokenNotFound indicates the presented refresh token does
+	// not exist in the store. Treated as authentication failure by callers.
+	ErrRefreshTokenNotFound = errors.New("refresh token not found")
+
+	// ErrRefreshTokenRevoked indicates the token was previously revoked
+	// (either explicitly via logout or implicitly via rotation). The
+	// service layer interprets this as a replay attempt and revokes the
+	// entire chain on first detection.
+	ErrRefreshTokenRevoked = errors.New("refresh token revoked")
+
+	// ErrRefreshTokenExpired indicates the token's expires_at has passed.
+	ErrRefreshTokenExpired = errors.New("refresh token expired")
 )
 
 // =============================================================================
@@ -56,6 +87,9 @@ const (
 	CodeInternal           ErrorCode = "internal_error"
 	CodeInvalidInput       ErrorCode = "invalid_input"
 	CodeUnsupportedNetwork ErrorCode = "unsupported_network"
+	CodeUnauthenticated    ErrorCode = "unauthenticated"
+	CodeForbidden          ErrorCode = "forbidden"
+	CodeConflict           ErrorCode = "conflict"
 )
 
 // =============================================================================
@@ -160,6 +194,42 @@ func NewInternalError(op string, err error) *AppError {
 	return &AppError{
 		Code:    CodeInternal,
 		Message: "internal server error",
+		Op:      op,
+		Err:     err,
+	}
+}
+
+// NewUnauthenticatedError creates an AppError for missing/invalid auth credentials.
+// The message stays vague on purpose — it must not leak whether the email
+// existed or the password was wrong.
+func NewUnauthenticatedError(op string, err error) *AppError {
+	return &AppError{
+		Code:    CodeUnauthenticated,
+		Message: "authentication required",
+		Op:      op,
+		Err:     err,
+	}
+}
+
+// NewForbiddenError creates an AppError for authorised-but-not-allowed cases,
+// e.g., a user tries to read another user's portfolio.
+func NewForbiddenError(op, message string) *AppError {
+	if message == "" {
+		message = "access denied"
+	}
+	return &AppError{
+		Code:    CodeForbidden,
+		Message: message,
+		Op:      op,
+	}
+}
+
+// NewConflictError creates an AppError for resource conflicts, e.g., a
+// registration attempt with an email that is already in use.
+func NewConflictError(op, message string, err error) *AppError {
+	return &AppError{
+		Code:    CodeConflict,
+		Message: message,
 		Op:      op,
 		Err:     err,
 	}

@@ -12,12 +12,22 @@ import (
 type Config struct {
 	// Shared
 	Port        string
+	GRPCPort    string
 	DatabaseURL string
 
 	// API
 	EthRPCURL       string
 	KleverBaseURL   string
 	CoinGeckoAPIKey string
+
+	// Auth (Module 4)
+	//
+	// JWTSigningKey is the HS256 secret used for access-token signing
+	// AND verification. The HTTP middleware and the gRPC interceptor
+	// both share this verifier so the same token works on both transports.
+	// Must be at least 32 bytes in production. Empty in dev → main.go
+	// substitutes an insecure but deterministic default and warns loudly.
+	JWTSigningKey string
 
 	// Event Watcher
 	EthWSURL          string        // WebSocket endpoint (used if available)
@@ -36,10 +46,15 @@ type Config struct {
 func Load() (*Config, error) {
 	cfg := &Config{
 		Port:            getEnv("PORT", "8080"),
+		GRPCPort:        getEnv("GRPC_PORT", "50051"),
 		DatabaseURL:     getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/portfolio?sslmode=disable"),
 		EthRPCURL:       getEnv("ETH_RPC_URL", "https://eth.drpc.org/"),
 		KleverBaseURL:   getEnv("KLEVER_API_BASE_URL", "https://api.mainnet.klever.org"),
 		CoinGeckoAPIKey: os.Getenv("COINGECKO_DEMO_API_KEY"), // optional
+
+		// Auth — empty allowed in dev; main.go warns loudly and uses a
+		// deterministic fallback so `make run` still works.
+		JWTSigningKey: os.Getenv("JWT_SIGNING_KEY"),
 
 		// Event watcher defaults
 		EthWSURL:          getEnv("ETH_WS_URL", ""),

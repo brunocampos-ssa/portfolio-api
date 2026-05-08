@@ -1,0 +1,44 @@
+// WalletService — list and add wallets.
+//
+// Mirrors GET /users/{id}/wallets and POST /users/{id}/wallets.
+syntax = "proto3";
+
+package portfolio.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/brunocampos-ssa/portfolio-api/gen/portfolio/v1;portfoliov1";
+
+service WalletService {
+  // ListWallets returns every wallet a user owns. Self-only.
+  rpc ListWallets(ListWalletsRequest) returns (ListWalletsResponse);
+
+  // AddWallet validates and creates a new wallet for a user. Self-only.
+  rpc AddWallet(AddWalletRequest) returns (AddWalletResponse);
+}
+
+message Wallet {
+  string id = 1;
+  string user_id = 2;
+  string blockchain = 3;
+  string address = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
+
+message ListWalletsRequest {
+  string user_id = 1;
+}
+
+message ListWalletsResponse {
+  repeated Wallet wallets = 1;
+}
+
+message AddWalletRequest {
+  string user_id = 1;
+  string blockchain = 2;
+  string address = 3;
+}
+
+message AddWalletResponse {
+  Wallet wallet = 1;
+}
