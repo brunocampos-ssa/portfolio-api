@@ -1,8 +1,11 @@
-// AuthService — registration, login, refresh-with-rotation, logout.
+// AuthService — registration and login.
 //
-// Mirror of the REST /auth/* endpoints. Class 1 ships these four RPCs
-// over gRPC so students see how the same service surface is exposed
-// across two transports without duplicating business logic.
+// Partial mirror of the REST /auth/* endpoints. Class 1 ships Register
+// and Login over gRPC so students see how the same service surface is
+// exposed across two transports without duplicating business logic.
+// Refresh and Logout are deliberately REST-only in Class 1 — see the
+// service docstring below and the README ("What's deferred to Aula 2")
+// for the rationale.
 syntax = "proto3";
 
 package portfolio.v1;

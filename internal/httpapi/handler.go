@@ -27,13 +27,16 @@ func NewHandler(svc *service.PortfolioService) *Handler {
 }
 
 // RegisterRoutes registers every route this handler owns onto the given
-// mux. Kept for backwards compatibility — production wiring should prefer
-// RegisterPublicRoutes + RegisterProtectedRoutes so the JWT middleware
-// can wrap only the protected portion.
+// mux. Convenience wrapper for callers that mount everything on a single
+// mux and apply JWT middleware externally; production wiring should
+// prefer RegisterPublicRoutes + RegisterProtectedRoutes so the JWT
+// middleware wraps only the protected portion.
 //
-// Module 4 added auth: callers that want gating SHOULD use the split.
-// Callers that want the pre-Module-4 wide-open setup (or a test that
-// mounts everything on one mux) can keep using this method.
+// Note: this is NOT a "wide-open" / unauthenticated surface. Since
+// Module 4 the protected handlers always enforce requireSelf, which
+// returns 401 when JWT claims are missing from the request context. Use
+// the split if you need a different gating policy; do not rely on this
+// method to bypass auth.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	h.RegisterPublicRoutes(mux)
 	h.RegisterProtectedRoutes(mux)

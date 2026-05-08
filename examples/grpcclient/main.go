@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -135,7 +136,7 @@ func isAlreadyExists(err error) bool {
 	if !ok {
 		return false
 	}
-	return st.Code().String() == "AlreadyExists"
+	return st.Code() == codes.AlreadyExists
 }
 
 // jwtSubjectInsecure decodes the JWT payload and returns the "sub" claim

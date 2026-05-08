@@ -205,7 +205,9 @@ curl -X POST localhost:8080/auth/login \
 curl -H 'Authorization: Bearer <access_token>' \
   localhost:8080/users/<user_id>/portfolio
 
-# grpcurl reference (server reflection is enabled in dev):
+# grpcurl reference (server reflection is always-on in this teaching
+# codebase — convenient for grpcurl/grpcui; production deployments would
+# typically gate it behind a flag):
 grpcurl -plaintext -d '{"email":"alice@example.com","password":"correct-horse-battery"}' \
   localhost:50051 portfolio.v1.AuthService/Login
 
