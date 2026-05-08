@@ -22,6 +22,12 @@ watcher:
 snapshot:
 	go run ./cmd/snapshot-runner
 
+# Run the event persister (Kafka consumer → wallet_events table).
+# Pair with `make watcher` in another terminal: events flow
+# Anvil/Ethereum → poller → Kafka → persister → Postgres.
+persister:
+	go run ./cmd/event-persister
+
 # Build all binaries
 build:
 	go build -o bin/portfolio-api ./cmd/api
@@ -53,6 +59,15 @@ db-reset:
 	@echo "Waiting for PostgreSQL to be ready..."
 	@sleep 3
 	@echo "Database reset complete. Migrations ran automatically."
+
+# Tail wallet_events from the in-compose Postgres. Counterpart to
+# `make broker-tail` for the chapter walkthrough: students run
+# `make watcher` + `make persister`, then `make db-tail` to see rows
+# materialise as the persister consumes from Kafka.
+db-tail:
+	@docker compose exec postgres psql -U postgres -d portfolio -c \
+	    "SELECT id, wallet_id, token_symbol, direction, block_number, created_at \
+	     FROM wallet_events ORDER BY created_at DESC LIMIT 20;"
 
 # =============================================================================
 # Module 4 Aula 2 — Brokers (Kafka + RabbitMQ).

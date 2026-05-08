@@ -120,17 +120,18 @@ func TestKafkaPublisher_RoundTripAndPartitionAffinity(t *testing.T) {
 
 func newEnvelope(eventID, walletID, token string, block uint64, emitted time.Time) *broker.EventEnvelope {
 	return &broker.EventEnvelope{
-		EventID:       eventID,
-		SchemaVersion: broker.SchemaCurrent,
-		Network:       "ethereum",
-		EventType:     "transfer",
-		Direction:     "incoming",
-		WalletID:      walletID,
-		TokenSymbol:   token,
-		Amount:        "1.0",
-		TxHash:        "0x" + eventID, // unique per event
-		BlockNumber:   block,
-		EmittedAt:     emitted,
+		EventID:         eventID,
+		SchemaVersion:   broker.SchemaCurrent,
+		Network:         "ethereum",
+		EventType:       "transfer",
+		Direction:       "incoming",
+		WalletID:        walletID,
+		TokenSymbol:     token,
+		ContractAddress: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", // USDC mainnet — fixture
+		Amount:          "1.0",
+		TxHash:          "0x" + eventID, // unique per event
+		BlockNumber:     block,
+		EmittedAt:       emitted,
 	}
 }
 

@@ -91,6 +91,12 @@ type EventEnvelope struct {
 	// "ETH", ...). Third segment of the routing key (lowercased).
 	TokenSymbol string `json:"token_symbol"`
 
+	// ContractAddress is the on-chain contract this event came from
+	// (lowercase). For ERC-20 transfers this disambiguates same-symbol
+	// tokens across chains (USDC on mainnet vs L2). The persister
+	// stores it directly; downstream analytics can group by it.
+	ContractAddress string `json:"contract_address"`
+
 	// Amount is the human-readable decimal amount as a string to avoid
 	// the float-precision trap. Consumers parse with shopspring/decimal
 	// or math/big as appropriate.
@@ -164,6 +170,9 @@ func (e *EventEnvelope) Validate() error {
 	}
 	if e.TxHash == "" {
 		return fmt.Errorf("broker: envelope missing tx_hash")
+	}
+	if e.ContractAddress == "" {
+		return fmt.Errorf("broker: envelope missing contract_address")
 	}
 	return nil
 }

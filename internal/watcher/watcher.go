@@ -228,17 +228,18 @@ func (w *Watcher) runPublishStage(ctx context.Context, events <-chan *domain.Wal
 func eventToEnvelope(e *domain.WalletEvent) *broker.EventEnvelope {
 	const network = "ethereum" // watcher only handles Ethereum today
 	return &broker.EventEnvelope{
-		EventID:       makeEventID(network, e.TxHash, e.WalletID, e.Direction),
-		SchemaVersion: broker.SchemaCurrent,
-		Network:       network,
-		EventType:     e.EventType,
-		Direction:     e.Direction,
-		WalletID:      e.WalletID,
-		TokenSymbol:   e.TokenSymbol,
-		Amount:        e.Amount,
-		TxHash:        e.TxHash,
-		BlockNumber:   e.BlockNumber,
-		EmittedAt:     time.Now().UTC(),
+		EventID:         makeEventID(network, e.TxHash, e.WalletID, e.Direction),
+		SchemaVersion:   broker.SchemaCurrent,
+		Network:         network,
+		EventType:       e.EventType,
+		Direction:       e.Direction,
+		WalletID:        e.WalletID,
+		TokenSymbol:     e.TokenSymbol,
+		ContractAddress: e.ContractAddress,
+		Amount:          e.Amount,
+		TxHash:          e.TxHash,
+		BlockNumber:     e.BlockNumber,
+		EmittedAt:       time.Now().UTC(),
 	}
 }
 

@@ -13,17 +13,18 @@ import (
 // SchemaCurrent bump and a discussion about consumer compatibility.
 func TestEnvelope_RoundTrip(t *testing.T) {
 	in := &EventEnvelope{
-		EventID:       "evt_abc123",
-		SchemaVersion: SchemaCurrent,
-		Network:       "ethereum",
-		EventType:     "transfer",
-		Direction:     "incoming",
-		WalletID:      "w_42",
-		TokenSymbol:   "USDC",
-		Amount:        "1234.56",
-		TxHash:        "0xdeadbeef",
-		BlockNumber:   25_050_419,
-		EmittedAt:     time.Date(2026, 5, 8, 16, 30, 0, 0, time.UTC),
+		EventID:         "evt_abc123",
+		SchemaVersion:   SchemaCurrent,
+		Network:         "ethereum",
+		EventType:       "transfer",
+		Direction:       "incoming",
+		WalletID:        "w_42",
+		TokenSymbol:     "USDC",
+		ContractAddress: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+		Amount:          "1234.56",
+		TxHash:          "0xdeadbeef",
+		BlockNumber:     25_050_419,
+		EmittedAt:       time.Date(2026, 5, 8, 16, 30, 0, 0, time.UTC),
 	}
 
 	bytes, err := in.Marshal()
@@ -43,7 +44,8 @@ func TestEnvelope_SchemaMismatch(t *testing.T) {
 	bytes := []byte(`{
 		"event_id":"e1","schema_version":99,"network":"ethereum",
 		"event_type":"transfer","direction":"incoming","wallet_id":"w1",
-		"token_symbol":"USDC","amount":"1","tx_hash":"0x1","block_number":1,
+		"token_symbol":"USDC","contract_address":"0xa0b8",
+		"amount":"1","tx_hash":"0x1","block_number":1,
 		"emitted_at":"2026-05-08T00:00:00Z"
 	}`)
 	_, err := Unmarshal(bytes)
@@ -64,6 +66,7 @@ func TestEnvelope_RequiredFields(t *testing.T) {
 		{"missing network", func(e *EventEnvelope) { e.Network = "" }},
 		{"missing wallet_id", func(e *EventEnvelope) { e.WalletID = "" }},
 		{"missing tx_hash", func(e *EventEnvelope) { e.TxHash = "" }},
+		{"missing contract_address", func(e *EventEnvelope) { e.ContractAddress = "" }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -85,16 +88,17 @@ func TestRoutingKey_Format(t *testing.T) {
 
 func validEnvelope() *EventEnvelope {
 	return &EventEnvelope{
-		EventID:       "evt_1",
-		SchemaVersion: SchemaCurrent,
-		Network:       "ethereum",
-		EventType:     "transfer",
-		Direction:     "incoming",
-		WalletID:      "w_1",
-		TokenSymbol:   "USDC",
-		Amount:        "1",
-		TxHash:        "0x1",
-		BlockNumber:   1,
-		EmittedAt:     time.Now().UTC(),
+		EventID:         "evt_1",
+		SchemaVersion:   SchemaCurrent,
+		Network:         "ethereum",
+		EventType:       "transfer",
+		Direction:       "incoming",
+		WalletID:        "w_1",
+		TokenSymbol:     "USDC",
+		ContractAddress: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+		Amount:          "1",
+		TxHash:          "0x1",
+		BlockNumber:     1,
+		EmittedAt:       time.Now().UTC(),
 	}
 }
