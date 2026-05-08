@@ -150,6 +150,14 @@ func (e *Env) SeedToken(ctx context.Context, addr, tokenSymbol string) (string, 
 // On any failure, whatever was successfully started is cleaned up before
 // the error is returned — no partial containers are leaked.
 func Setup(ctx context.Context, opts ...Options) (*Env, error) {
+	// Load the project's .env (if any) BEFORE resolveOptions runs, so
+	// values like TEST_ETH_FORK_URL kick in for `go test` invocations
+	// that didn't `source .env` first. Pre-existing env vars win — see
+	// loadDotenv for the full semantics.
+	if err := loadDotenv(); err != nil {
+		return nil, fmt.Errorf("testenv.Setup: load .env: %w", err)
+	}
+
 	opt := resolveOptions(opts...)
 
 	bootCtx, cancel := context.WithTimeout(ctx, opt.StartupTimeout)
