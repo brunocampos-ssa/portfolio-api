@@ -89,6 +89,84 @@ func TestHTTPAuth_ReplayDetectionRevokesChain(t *testing.T) {
 	httpRefreshExpect(t, stack, rotated["refresh_token"].(string), http.StatusUnauthorized)
 }
 
+// TestHTTPAuth_ConcurrentRefreshSerialisesAndDeniesLoser proves the
+// transactional rotation in RefreshTokenRepository.Rotate: two refreshes
+// of the SAME token fired in parallel must serialise — exactly one
+// succeeds, the other is treated as replay. The losing goroutine
+// receives 401 and the entire chain (old + winner's new) ends up
+// revoked, so neither token can be used again.
+//
+// This is the regression test for the race called out in PR #3 review:
+// without the row-locked tx, both goroutines could pass the freshness
+// check, both insert new tokens, and the loser's new token would remain
+// valid as an orphan. With Rotate, the second tx blocks on the FOR
+// UPDATE lock, then sees revoked_at != NULL and bubbles
+// ErrRefreshTokenRevoked, which the service maps to a 401 + family
+// revoke.
+func TestHTTPAuth_ConcurrentRefreshSerialisesAndDeniesLoser(t *testing.T) {
+	stack := newAuthStack(t)
+	email := uniqueEmail(t, "concurrent")
+	httpRegister(t, stack, email, "Race User", "correct-horse-battery")
+	tokens := httpLogin(t, stack, email, "correct-horse-battery")
+	original := tokens["refresh_token"].(string)
+
+	type result struct {
+		status int
+		body   map[string]any
+	}
+	results := make(chan result, 2)
+	start := make(chan struct{})
+
+	for range 2 {
+		go func() {
+			<-start // fire both as close together as possible
+			resp := httpPostJSON(t, stack, "/auth/refresh", map[string]string{
+				"refresh_token": original,
+			})
+			defer resp.Body.Close()
+			raw := mustReadString(t, resp)
+			var body map[string]any
+			_ = json.Unmarshal([]byte(raw), &body)
+			results <- result{status: resp.StatusCode, body: body}
+		}()
+	}
+	close(start)
+
+	r1 := <-results
+	r2 := <-results
+
+	// Exactly one must succeed (200) and one must be denied (401). It
+	// doesn't matter which goroutine wins — only that the outcomes are
+	// asymmetric. If both got 200 the race is unfixed; if both got 401
+	// the legitimate refresh failed.
+	successes := 0
+	failures := 0
+	var winnerRefresh string
+	for _, r := range []result{r1, r2} {
+		switch r.status {
+		case http.StatusOK:
+			successes++
+			if rt, ok := r.body["refresh_token"].(string); ok {
+				winnerRefresh = rt
+			}
+		case http.StatusUnauthorized:
+			failures++
+		default:
+			t.Fatalf("unexpected status from concurrent refresh: %d (body=%v)", r.status, r.body)
+		}
+	}
+	require.Equal(t, 1, successes, "exactly one concurrent refresh must succeed")
+	require.Equal(t, 1, failures, "exactly one concurrent refresh must be denied")
+	require.NotEmpty(t, winnerRefresh)
+
+	// Side-effect: the loser's denial revoked the family. The original
+	// token is gone (winner already rotated it) and the winner's new
+	// refresh token must now also be revoked, because the loser triggered
+	// RevokeFamily(original).
+	httpRefreshExpect(t, stack, original, http.StatusUnauthorized)
+	httpRefreshExpect(t, stack, winnerRefresh, http.StatusUnauthorized)
+}
+
 func TestHTTPAuth_CrossAccountForbidden(t *testing.T) {
 	stack := newAuthStack(t)
 	emailA := uniqueEmail(t, "alice")

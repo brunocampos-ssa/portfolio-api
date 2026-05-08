@@ -73,8 +73,8 @@ func (m *RefreshTokenRepository) FindByHash(ctx context.Context, tokenHash strin
 	return t, args.Error(1)
 }
 
-func (m *RefreshTokenRepository) MarkRotated(ctx context.Context, oldID, newID string, revokedAt time.Time) error {
-	return m.Called(ctx, oldID, newID, revokedAt).Error(0)
+func (m *RefreshTokenRepository) Rotate(ctx context.Context, oldID string, newToken *domain.RefreshToken, revokedAt time.Time) error {
+	return m.Called(ctx, oldID, newToken, revokedAt).Error(0)
 }
 
 func (m *RefreshTokenRepository) Revoke(ctx context.Context, id string, revokedAt time.Time) error {

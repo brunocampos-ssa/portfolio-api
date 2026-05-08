@@ -246,17 +246,16 @@ func TestAuthService_Refresh_RotatesAndIssuesNewPair(t *testing.T) {
 		ExpiresAt: h.now.Add(24 * time.Hour),
 	}
 	h.refresh.On("FindByHash", mock.Anything, sha256Hex(original)).Return(row, nil).Once()
-	h.refresh.On("Insert", mock.Anything, mock.MatchedBy(func(rt *domain.RefreshToken) bool {
+	h.refresh.On("Rotate", mock.Anything, "rt-old", mock.MatchedBy(func(rt *domain.RefreshToken) bool {
 		return rt.UserID == "u-1" && rt.TokenHash != row.TokenHash
-	})).Return(nil).Once()
-	h.refresh.On("MarkRotated", mock.Anything, "rt-old", mock.AnythingOfType("string"), h.now).
-		Return(nil).Once()
+	}), h.now).Return(nil).Once()
 
 	tokens, err := h.svc.Refresh(context.Background(), original, "ua", "1.2.3.4")
 	require.NoError(t, err)
 	require.NotEqual(t, original, tokens.RefreshToken, "rotated token must differ")
 	require.NotEmpty(t, tokens.AccessToken)
 	h.refresh.AssertExpectations(t)
+	h.refresh.AssertNotCalled(t, "Insert", mock.Anything, mock.Anything)
 }
 
 func TestAuthService_Refresh_DetectsReplayAndRevokesFamily(t *testing.T) {
@@ -282,7 +281,37 @@ func TestAuthService_Refresh_DetectsReplayAndRevokesFamily(t *testing.T) {
 	require.Equal(t, domain.CodeUnauthenticated, appErr.Code)
 	h.refresh.AssertExpectations(t)
 	h.refresh.AssertNotCalled(t, "Insert", mock.Anything, mock.Anything)
-	h.refresh.AssertNotCalled(t, "MarkRotated", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	h.refresh.AssertNotCalled(t, "Rotate", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+}
+
+// TestAuthService_Refresh_RaceLossTreatedAsReplay covers the
+// concurrent-refresh path: two callers both pass the service-level
+// freshness check, but the repository's transactional Rotate detects
+// the race at lock time and returns ErrRefreshTokenRevoked. Same
+// service response as the explicit replay path: revoke the family,
+// return Unauthenticated.
+func TestAuthService_Refresh_RaceLossTreatedAsReplay(t *testing.T) {
+	h := newAuthHarness(t)
+
+	original := "raw-refresh-token-race"
+	row := &domain.RefreshToken{
+		ID:        "rt-old",
+		UserID:    "u-1",
+		TokenHash: sha256Hex(original),
+		IssuedAt:  h.now.Add(-time.Hour),
+		ExpiresAt: h.now.Add(24 * time.Hour),
+	}
+	h.refresh.On("FindByHash", mock.Anything, sha256Hex(original)).Return(row, nil).Once()
+	h.refresh.On("Rotate", mock.Anything, "rt-old", mock.AnythingOfType("*domain.RefreshToken"), h.now).
+		Return(domain.ErrRefreshTokenRevoked).Once()
+	h.refresh.On("RevokeFamily", mock.Anything, "rt-old", h.now).Return(nil).Once()
+
+	_, err := h.svc.Refresh(context.Background(), original, "ua", "1.2.3.4")
+	require.Error(t, err)
+	var appErr *domain.AppError
+	require.ErrorAs(t, err, &appErr)
+	require.Equal(t, domain.CodeUnauthenticated, appErr.Code)
+	h.refresh.AssertExpectations(t)
 }
 
 func TestAuthService_Refresh_RejectsExpiredToken(t *testing.T) {

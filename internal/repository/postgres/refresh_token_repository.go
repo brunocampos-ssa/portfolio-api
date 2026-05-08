@@ -71,31 +71,83 @@ func (r *RefreshTokenRepository) FindByHash(ctx context.Context, tokenHash strin
 	return t, nil
 }
 
-// MarkRotated marks oldID revoked and links replaced_by → newID, atomically.
+// Rotate atomically inserts newToken and marks oldID revoked + linked to
+// newToken.ID, in a single transaction.
 //
-// "Atomically" matters because the rotation MUST be all-or-nothing: if we
-// mark old revoked but never insert new, the user gets logged out; if we
-// insert new but never mark old revoked, both tokens are valid and a
-// stolen old token would not trigger replay detection. The caller is
-// expected to have already inserted newID, but the UPDATE itself is the
-// linearisation point.
-func (r *RefreshTokenRepository) MarkRotated(ctx context.Context, oldID, newID string, revokedAt time.Time) error {
-	const op = "RefreshTokenRepository.MarkRotated"
+// "Atomically" matters for two reasons:
+//
+//  1. All-or-nothing rotation: if we mark old revoked but never insert new,
+//     the user gets logged out; if we insert new but never mark old
+//     revoked, both tokens are valid and a stolen old token would not
+//     trigger replay detection.
+//
+//  2. Concurrency: two concurrent refreshes of the same token can both
+//     pass the service-level freshness check (row.RevokedAt == nil) and
+//     race here. Without a row lock, both would insert their own new
+//     token and both would succeed at UPDATE — the loser's new token
+//     becomes an orphan: valid, unrevoked, and unreachable from
+//     RevokeFamily(oldID) because replaced_by points at the winner.
+//
+// We solve both by opening a transaction, taking SELECT ... FOR UPDATE on
+// the old row, asserting it is still fresh, then INSERT + UPDATE within
+// the same tx and committing. A concurrent caller blocks on the row lock
+// until we commit, then sees revoked_at != NULL and returns
+// ErrRefreshTokenRevoked — which AuthService.Refresh treats as replay.
+//
+// Returns ErrRefreshTokenNotFound if oldID is not in the table at all
+// (caller bug — Refresh has already FindByHash'd) and
+// ErrRefreshTokenRevoked if the row is already revoked or already linked
+// (lost the rotation race / genuine replay).
+func (r *RefreshTokenRepository) Rotate(ctx context.Context, oldID string, newToken *domain.RefreshToken, revokedAt time.Time) error {
+	const op = "RefreshTokenRepository.Rotate"
 
-	query := `UPDATE refresh_tokens
-	          SET revoked_at = $1, replaced_by = $2
-	          WHERE id = $3`
+	if newToken == nil {
+		return fmt.Errorf("%s: newToken must not be nil", op)
+	}
 
-	res, err := r.db.ExecContext(ctx, query, revokedAt, newID, oldID)
+	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("%s: update failed: %w", op, err)
+		return fmt.Errorf("%s: begin tx: %w", op, err)
 	}
-	rows, err := res.RowsAffected()
+	// Rollback is a no-op after a successful Commit; safe in either path.
+	defer func() { _ = tx.Rollback() }()
+
+	// Lock the old row so concurrent rotations of the same token serialise.
+	var existingRevokedAt *time.Time
+	var existingReplacedBy *string
+	err = tx.QueryRowContext(ctx,
+		`SELECT revoked_at, replaced_by FROM refresh_tokens WHERE id = $1 FOR UPDATE`,
+		oldID,
+	).Scan(&existingRevokedAt, &existingReplacedBy)
 	if err != nil {
-		return fmt.Errorf("%s: rows affected: %w", op, err)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%s: %w", op, domain.ErrRefreshTokenNotFound)
+		}
+		return fmt.Errorf("%s: lock old: %w", op, err)
 	}
-	if rows == 0 {
-		return fmt.Errorf("%s: %w", op, domain.ErrRefreshTokenNotFound)
+	if existingRevokedAt != nil || existingReplacedBy != nil {
+		return fmt.Errorf("%s: %w", op, domain.ErrRefreshTokenRevoked)
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO refresh_tokens
+		    (id, user_id, token_hash, issued_at, expires_at, revoked_at, replaced_by, user_agent, ip)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		newToken.ID, newToken.UserID, newToken.TokenHash, newToken.IssuedAt, newToken.ExpiresAt,
+		newToken.RevokedAt, newToken.ReplacedBy, newToken.UserAgent, newToken.IP,
+	); err != nil {
+		return fmt.Errorf("%s: insert new: %w", op, err)
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE refresh_tokens SET revoked_at = $1, replaced_by = $2 WHERE id = $3`,
+		revokedAt, newToken.ID, oldID,
+	); err != nil {
+		return fmt.Errorf("%s: rotate old: %w", op, err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("%s: commit: %w", op, err)
 	}
 	return nil
 }

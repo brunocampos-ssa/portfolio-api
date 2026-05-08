@@ -34,9 +34,20 @@ type RefreshTokenRepository interface {
 	// domain.ErrRefreshTokenNotFound when no row matches.
 	FindByHash(ctx context.Context, tokenHash string) (*domain.RefreshToken, error)
 
-	// MarkRotated atomically marks oldID as revoked and links it to newID
-	// via replaced_by. Used during /auth/refresh to record the rotation.
-	MarkRotated(ctx context.Context, oldID, newID string, revokedAt time.Time) error
+	// Rotate atomically inserts newToken AND marks oldID revoked + linked
+	// to newToken.ID via replaced_by, in a single DB transaction guarded by
+	// SELECT ... FOR UPDATE on the old row. This serialises concurrent
+	// refresh attempts of the same token: only one rotation wins; the
+	// loser sees the old row already revoked and gets back
+	// domain.ErrRefreshTokenRevoked, which the caller treats as replay
+	// (revoke the family, force re-auth).
+	//
+	// This replaces the old "Insert then MarkRotated" two-step flow which
+	// was vulnerable to a race that left an orphan refresh token: two
+	// concurrent refreshes could both pass the freshness check, both
+	// insert their own new token, and both UPDATE the old row — leaving
+	// the loser's new token valid but unreferenced by replaced_by.
+	Rotate(ctx context.Context, oldID string, newToken *domain.RefreshToken, revokedAt time.Time) error
 
 	// Revoke marks a single token revoked. Idempotent — revoking an
 	// already-revoked token is a no-op.
