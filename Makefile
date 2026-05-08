@@ -76,6 +76,20 @@ broker-logs:
 broker-tail:
 	docker compose --profile tools run --rm kafka-tail
 
+# List Kafka consumer groups and describe each — partition assignment,
+# current offset, log-end offset, and LAG. The headline visual for the
+# kafka.Consumer step: students see persister and analytics groups
+# committed at different offsets on the same topic, proving the
+# consumer-groups-have-independent-state property.
+broker-groups:
+	@echo "--- consumer groups ---"
+	@docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+	    --bootstrap-server localhost:9092 --list
+	@echo ""
+	@echo "--- group details (partition / offset / lag) ---"
+	@docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+	    --bootstrap-server localhost:9092 --all-groups --describe || true
+
 # Bring up everything the chapter needs (DB + brokers).
 infra-up:
 	docker compose up -d postgres kafka rabbitmq

@@ -3,38 +3,96 @@ package kafka
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log"
+	"time"
 
 	kafkago "github.com/segmentio/kafka-go"
 
 	"github.com/brunocampos-ssa/portfolio-api/internal/broker"
 )
 
-// Consumer implements broker.Consumer against a Kafka cluster using a
-// consumer group.
+// =============================================================================
+// Consumer — group-aware Kafka reader with bounded retry
+// =============================================================================
 //
-// TODO Class 2: wrap a *kafka.Reader configured with:
-//   - GroupID = the consumer-group identifier (each cmd/event-* uses a
-//     distinct one — see broker/topics.go for the constants).
-//   - StartOffset = FirstOffset on first run so the group catches up
-//     on history; subsequent runs resume from committed offsets.
-//   - CommitInterval = 0 forces synchronous commits — at-least-once
-//     semantics, with idempotent handlers absorbing the duplicate-
-//     delivery risk. We will explicitly NOT use auto-commit; commits
-//     happen after the handler returns nil.
+// The consumer's contract:
+//
+//   - FetchMessage advances a local cursor; CommitMessages records the
+//     offset on the broker. They are deliberately separate so we can
+//     run the handler BEFORE acknowledging — at-least-once semantics.
+//
+//   - On handler success: commit the offset.
+//
+//   - On handler error: retry the SAME message with exponential
+//     backoff up to maxRetries. After exhaustion, commit anyway and
+//     log loudly. A production system would route to a DLQ; we keep
+//     the in-process model for Class 2 and let the next chapter add
+//     a real DLQ topic.
+//
+//   - On schema-decode error: commit and skip. Otherwise a single
+//     poison-pill from a future producer would freeze the partition
+//     for every consumer in this group forever.
+//
+//   - On ctx cancellation: return ctx.Err(), preserving the offset
+//     state. The next process start resumes from the last successful
+//     commit, redelivering anything that was in flight.
+//
+// Class 2 lesson: idempotency is the HANDLER's responsibility, not
+// the consumer's. The persister keys on (tx_hash, wallet_id,
+// direction) UNIQUE. The router stamps a delivery-id header so the
+// notifier can dedupe. The analytics consumer doesn't commit at all
+// (it always replays — see event-analytics for that pattern).
+
+const (
+	// maxRetries bounds same-message retry attempts before giving up
+	// and committing the offset. 3 is enough to absorb a transient
+	// network blip (DB reconnect, downstream restart) without holding
+	// up the partition indefinitely on a genuinely poisonous payload.
+	maxRetries = 3
+
+	// initialBackoff is the first inter-retry delay. Doubles each
+	// attempt. With maxRetries=3 and initialBackoff=200ms, the worst
+	// case spent on one bad message is ~200ms + 400ms = 600ms before
+	// the third (and final) attempt.
+	initialBackoff = 200 * time.Millisecond
+)
+
+// Consumer implements broker.Consumer against a Kafka cluster using a
+// consumer group. Different services using the same topic with
+// different group IDs each get an independent view of the stream —
+// that's the headline Kafka teaching moment for Class 2.
+//
+// Configuration choices, all teaching points:
+//
+//   - StartOffset = FirstOffset: applied only on the FIRST run of a
+//     fresh group. Subsequent process starts resume from committed
+//     offsets. The persister catches up on history; the analytics
+//     consumer (in a future commit) overrides this so it always
+//     replays from the beginning.
+//
+//   - CommitInterval = 0: kafka-go's auto-commit is disabled. Commits
+//     happen explicitly via CommitMessages after the handler returns
+//     nil. This is what makes "handler runs before ack" the contract.
+//
+//   - MinBytes / MaxBytes: 1 byte minimum (low latency, the watcher
+//     emits one event per block tick) up to 10 MiB per fetch (well
+//     above the largest envelope we'd ever produce).
+//
+//   - MaxWait = 1s: cap how long a fetch blocks waiting for fresh
+//     data before returning empty. Lets ctx cancellation propagate
+//     within a second even when the topic is idle.
 type Consumer struct {
 	brokers []string
 	topic   string
 	groupID string
 
-	// reader is the kafka-go group-aware consumer. nil in the skeleton;
-	// Class 2 will populate it in NewConsumer.
 	reader *kafkago.Reader
 }
 
 // NewConsumer builds a consumer bound to a specific group. Different
 // services using the same topic with different group IDs each get an
-// independent view of the stream — that's the headline Kafka teaching
-// moment for Class 2.
+// independent view of the stream.
 func NewConsumer(brokers []string, topic, groupID string) (*Consumer, error) {
 	if len(brokers) == 0 {
 		return nil, errors.New("kafka.NewConsumer: brokers must not be empty")
@@ -45,20 +103,127 @@ func NewConsumer(brokers []string, topic, groupID string) (*Consumer, error) {
 	if groupID == "" {
 		return nil, errors.New("kafka.NewConsumer: groupID must not be empty")
 	}
-	return &Consumer{brokers: brokers, topic: topic, groupID: groupID}, nil
+
+	r := kafkago.NewReader(kafkago.ReaderConfig{
+		Brokers:        brokers,
+		Topic:          topic,
+		GroupID:        groupID,
+		StartOffset:    kafkago.FirstOffset,
+		MinBytes:       1,
+		MaxBytes:       10 << 20, // 10 MiB
+		MaxWait:        time.Second,
+		CommitInterval: 0, // synchronous commits via CommitMessages()
+	})
+
+	return &Consumer{
+		brokers: brokers,
+		topic:   topic,
+		groupID: groupID,
+		reader:  r,
+	}, nil
 }
 
-// Run consumes envelopes until ctx is cancelled. Handler errors trigger
-// a retry by NOT committing the offset.
+// Run drives the consume loop until ctx is cancelled. Returns ctx.Err()
+// on graceful shutdown, or a wrapped error if the underlying reader
+// fails in a non-recoverable way.
 //
-// TODO Class 2: loop on reader.FetchMessage, broker.Unmarshal the value,
-// invoke handler, and on nil call reader.CommitMessages.
-func (c *Consumer) Run(_ context.Context, _ broker.Handler) error {
-	return errors.New("kafka.Consumer.Run: not implemented (Class 2 stub)")
+// Concurrency: Run MUST be called from a single goroutine. The
+// underlying kafka-go Reader is not safe for concurrent FetchMessage.
+func (c *Consumer) Run(ctx context.Context, handler broker.Handler) error {
+	if c.reader == nil {
+		return errors.New("kafka.Consumer.Run: consumer is closed")
+	}
+	if handler == nil {
+		return errors.New("kafka.Consumer.Run: handler must not be nil")
+	}
+
+	for {
+		msg, err := c.reader.FetchMessage(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("kafka.Consumer.Run: fetch: %w", err)
+		}
+
+		env, err := broker.Unmarshal(msg.Value)
+		if err != nil {
+			// Poison pill — committing-and-skipping protects every
+			// future consumer in this group from being stuck on the
+			// same byte sequence.
+			log.Printf("kafka.Consumer[%s]: skip undecodable message partition=%d offset=%d: %v",
+				c.groupID, msg.Partition, msg.Offset, err)
+			if commitErr := c.reader.CommitMessages(ctx, msg); commitErr != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return fmt.Errorf("kafka.Consumer.Run: commit poison pill: %w", commitErr)
+			}
+			continue
+		}
+
+		if err := c.invokeWithRetry(ctx, handler, env); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			// Bounded retry exhausted. We commit so the partition
+			// keeps moving; a real DLQ would catch this. Log loudly
+			// so an operator can see what dropped on the floor.
+			log.Printf("kafka.Consumer[%s]: handler exhausted retries event_id=%s tx=%s: %v",
+				c.groupID, env.EventID, env.TxHash, err)
+		}
+
+		if err := c.reader.CommitMessages(ctx, msg); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("kafka.Consumer.Run: commit: %w", err)
+		}
+	}
+}
+
+// invokeWithRetry calls handler up to maxRetries times with
+// exponential backoff between attempts. Returns the last error if
+// every attempt failed; nil on the first success.
+//
+// Cancellation propagates through the backoff sleep so a shutdown
+// in the middle of retry doesn't add up to (maxRetries-1)*backoff
+// of latency.
+func (c *Consumer) invokeWithRetry(ctx context.Context, h broker.Handler, env *broker.EventEnvelope) error {
+	backoff := initialBackoff
+	var lastErr error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		err := h(ctx, env)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if attempt == maxRetries {
+			break
+		}
+		log.Printf("kafka.Consumer[%s]: handler attempt %d/%d failed event_id=%s: %v (retrying in %s)",
+			c.groupID, attempt, maxRetries, env.EventID, err, backoff)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+			backoff *= 2
+		}
+	}
+	return lastErr
 }
 
 // Close stops the reader and waits for in-flight fetches to drain.
+// Idempotent — calling Close twice is safe.
 func (c *Consumer) Close() error {
+	if c.reader == nil {
+		return nil
+	}
+	r := c.reader
+	c.reader = nil
+	if err := r.Close(); err != nil {
+		return fmt.Errorf("kafka.Consumer.Close: %w", err)
+	}
 	return nil
 }
 
