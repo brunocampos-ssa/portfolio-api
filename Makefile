@@ -70,6 +70,12 @@ broker-down:
 broker-logs:
 	docker compose logs -f kafka rabbitmq
 
+# Tail the wallet.events.v1 topic from t=0 across every partition.
+# Convenient for the chapter walkthrough — run alongside `make watcher`
+# to see envelopes stream in. NOT a production consumer.
+broker-tail:
+	docker compose --profile tools run --rm kafka-tail
+
 # Bring up everything the chapter needs (DB + brokers).
 infra-up:
 	docker compose up -d postgres kafka rabbitmq

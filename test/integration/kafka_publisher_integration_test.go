@@ -15,16 +15,15 @@ import (
 
 	"github.com/brunocampos-ssa/portfolio-api/internal/broker"
 	brokerkafka "github.com/brunocampos-ssa/portfolio-api/internal/broker/kafka"
-	"github.com/brunocampos-ssa/portfolio-api/internal/testutil/kafkatest"
 )
 
 // =============================================================================
 // kafka.Publisher integration test
 // =============================================================================
 //
-// Boots a real Kafka container via testcontainers, publishes a stream
-// of envelopes covering two wallets, reads them back with a raw
-// kafka-go Reader, and asserts:
+// Uses the shared testenv Kafka container, publishes a stream of
+// envelopes covering two wallets, reads them back with raw per-
+// partition kafka-go Readers, and asserts:
 //
 //   1. ROUND-TRIP INTEGRITY: every published envelope is delivered
 //      byte-identical (modulo Kafka's metadata).
@@ -35,31 +34,25 @@ import (
 //      future DLQ routing logic can act on them without parsing the
 //      body.
 //
-// The test creates its own short-lived Kafka container — it does NOT
-// share testenv (which is heavy: Postgres + Anvil + chain bootstrap).
-// Adding Kafka to testenv is a future move once multiple broker tests
-// land and amortising the boot cost matters.
+// Each test uses a unique topic name so concurrent or sequential tests
+// don't see each other's leftover messages on the shared cluster.
 
-const (
-	testKafkaTopic = "wallet.events.v1.test"
-	bootDeadline   = 90 * time.Second
-)
+const testKafkaTopicPrefix = "wallet.events.test"
 
 func TestKafkaPublisher_RoundTripAndPartitionAffinity(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), bootDeadline)
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
 
-	kh, err := kafkatest.Start(ctx)
-	require.NoError(t, err, "boot kafka container")
-	t.Cleanup(func() { _ = kh.Stop(context.Background()) })
+	require.NotEmpty(t, env.KafkaBrokers(), "testenv must provide Kafka brokers")
+	topic := testKafkaTopicPrefix + ".roundtrip"
 
 	// Pre-create the topic with 3 partitions so the partition-affinity
 	// assertion is meaningful — auto-created topics default to 1
 	// partition, in which case "everything on the same partition" is
 	// trivially true and proves nothing.
-	createTopic(t, kh.Brokers, testKafkaTopic, 3)
+	createTopic(t, env.KafkaBrokers(), topic, 3)
 
-	pub, err := brokerkafka.NewPublisher(kh.Brokers, testKafkaTopic)
+	pub, err := brokerkafka.NewPublisher(env.KafkaBrokers(), topic)
 	require.NoError(t, err)
 	defer pub.Close()
 
@@ -88,7 +81,7 @@ func TestKafkaPublisher_RoundTripAndPartitionAffinity(t *testing.T) {
 	// (no consumer group, just direct partition reads) so we observe
 	// which partition each message landed on. The Consumer wrapper's
 	// own integration test will exercise the group-aware path.
-	got, partitionByEventID := readAllMessages(t, kh.Brokers, testKafkaTopic, len(want), 30*time.Second)
+	got, partitionByEventID := readAllMessages(t, env.KafkaBrokers(), topic, len(want), 30*time.Second)
 
 	require.Len(t, got, len(want))
 

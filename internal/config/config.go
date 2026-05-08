@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -30,12 +31,20 @@ type Config struct {
 	JWTSigningKey string
 
 	// Event Watcher
-	EthWSURL          string        // WebSocket endpoint (used if available)
+	EthWSURL            string        // WebSocket endpoint (used if available)
 	WatcherPollInterval time.Duration // polling interval for eth_getLogs
-	WatcherStartBlock uint64        // block to start watching from (0 = latest)
+	WatcherStartBlock   uint64        // block to start watching from (0 = latest)
 
 	// Snapshot Runner
 	SnapshotWorkers int // number of concurrent workers for snapshot generation
+
+	// Class 2 — Messaging.
+	//
+	// KafkaBrokers is the bootstrap server list for the Kafka cluster.
+	// Comma-separated in the env var, slice in code so the publisher
+	// can validate each entry independently. Empty in test/dev when
+	// the watcher isn't being run against a real broker.
+	KafkaBrokers []string
 }
 
 // Load reads configuration from environment variables.
@@ -63,6 +72,9 @@ func Load() (*Config, error) {
 
 		// Snapshot runner defaults
 		SnapshotWorkers: parseInt("SNAPSHOT_WORKERS", 3),
+
+		// Messaging
+		KafkaBrokers: parseCSV("KAFKA_BROKERS", []string{"localhost:9092"}),
 	}
 
 	if cfg.DatabaseURL == "" {
@@ -113,4 +125,26 @@ func parseUint64(key string, fallback uint64) uint64 {
 		return fallback
 	}
 	return n
+}
+
+// parseCSV reads a comma-separated env var into a string slice. Empty
+// or unset env var falls back to the default. Whitespace around each
+// entry is trimmed because operators paste configs with arbitrary
+// formatting; we should tolerate it.
+func parseCSV(key string, fallback []string) []string {
+	val := os.Getenv(key)
+	if val == "" {
+		return fallback
+	}
+	parts := strings.Split(val, ",")
+	out := parts[:0]
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	if len(out) == 0 {
+		return fallback
+	}
+	return out
 }

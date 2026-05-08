@@ -93,6 +93,37 @@ services:
           --describe --topic wallet.events.v1
     restart: "no"
 
+  # Class 2 — convenience consumer for the chapter walkthrough.
+  #
+  # Run alongside `make watcher` to see envelopes streaming as the
+  # watcher publishes them:
+  #
+  #   docker compose run --rm kafka-tail
+  #
+  # Reads from the beginning of wallet.events.v1 across every
+  # partition, prints the JSON value of each message. NOT a
+  # production consumer — kafka.Consumer (next implementation step)
+  # is the real, group-aware path. This exists purely so the
+  # "watcher → Kafka" wiring is observable from the host without
+  # writing a Go program to verify.
+  kafka-tail:
+    image: apache/kafka:3.7.0
+    container_name: portfolio-kafka-tail
+    profiles: ["tools"] # excluded from default `up`
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint:
+      - /opt/kafka/bin/kafka-console-consumer.sh
+      - --bootstrap-server=kafka:9092
+      - --topic=wallet.events.v1
+      - --from-beginning
+      - --property=print.timestamp=true
+      - --property=print.partition=true
+      - --property=print.headers=true
+      - --property=print.key=true
+      - --property=key.separator=|
+
   # Class 2 — RabbitMQ with the management UI on 15672 (login
   # guest/guest). The notifier subscribes through the topic exchange
   # declared by the router on first publish.

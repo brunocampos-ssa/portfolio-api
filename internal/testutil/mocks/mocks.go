@@ -22,6 +22,7 @@ import (
 
 	"github.com/stretchr/testify/mock"
 
+	"github.com/brunocampos-ssa/portfolio-api/internal/broker"
 	"github.com/brunocampos-ssa/portfolio-api/internal/contracts"
 	"github.com/brunocampos-ssa/portfolio-api/internal/domain"
 )
@@ -37,7 +38,35 @@ var (
 	_ contracts.TokenBalanceProvider   = (*TokenBalanceProvider)(nil)
 	_ contracts.PriceProvider          = (*PriceProvider)(nil)
 	_ contracts.LogsFetcher            = (*LogsFetcher)(nil)
+	_ broker.Publisher                 = (*BrokerPublisher)(nil)
 )
+
+// -----------------------------------------------------------------------------
+// Broker
+// -----------------------------------------------------------------------------
+
+// BrokerPublisher is the mock for broker.Publisher used by the watcher's
+// unit tests. Tests assert against Publish calls — argument matching,
+// call count, and the captured envelope's fields.
+type BrokerPublisher struct{ mock.Mock }
+
+func (m *BrokerPublisher) Publish(ctx context.Context, env *broker.EventEnvelope) error {
+	return m.Called(ctx, env).Error(0)
+}
+
+func (m *BrokerPublisher) Close() error {
+	// Unit tests rarely care about Close — return nil unless explicitly
+	// expected via .On("Close"). The On() registration takes precedence
+	// because testify's mock.Called returns the registered behavior.
+	if len(m.ExpectedCalls) > 0 {
+		for _, c := range m.ExpectedCalls {
+			if c.Method == "Close" {
+				return m.Called().Error(0)
+			}
+		}
+	}
+	return nil
+}
 
 // -----------------------------------------------------------------------------
 // Repositories

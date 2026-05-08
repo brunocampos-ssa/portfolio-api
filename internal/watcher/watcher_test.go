@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
+	"github.com/brunocampos-ssa/portfolio-api/internal/broker"
 	"github.com/brunocampos-ssa/portfolio-api/internal/domain"
 	"github.com/brunocampos-ssa/portfolio-api/internal/testutil/mocks"
 	"github.com/brunocampos-ssa/portfolio-api/internal/watcher"
@@ -103,9 +104,9 @@ func TestWatcher_Run_NoTrackedWallets_ExitsOnCtx(t *testing.T) {
 		Return([]domain.Wallet{}, nil)
 
 	logsFetcher := newScriptedLogsFetcher() // never triggered — intentional
-	eventRepo := &mocks.EventRepository{}
+	publisher := &mocks.BrokerPublisher{}
 
-	w := watcher.NewWatcher(logsFetcher, walletRepo, eventRepo, 50*time.Millisecond)
+	w := watcher.NewWatcher(logsFetcher, walletRepo, publisher, 50*time.Millisecond)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
 	defer cancel()
@@ -113,12 +114,17 @@ func TestWatcher_Run_NoTrackedWallets_ExitsOnCtx(t *testing.T) {
 	err := w.Run(ctx)
 	require.True(t, errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled))
 	walletRepo.AssertExpectations(t)
+	publisher.AssertNotCalled(t, "Publish", mock.Anything, mock.Anything)
 }
 
-// TestWatcher_Run_PersistsMatchedEvent drives a tracked wallet through the
-// full pipeline (poller → normalizer → fan-out → persist worker) and
-// verifies EventRepository.Create was invoked.
-func TestWatcher_Run_PersistsMatchedEvent(t *testing.T) {
+// TestWatcher_Run_PublishesMatchedEvent drives a tracked wallet through
+// the full pipeline (poller → normalizer → publish stage) and verifies
+// the publisher saw the event with the expected envelope shape.
+//
+// The shape assertions are the load-bearing piece: the unit test does
+// not have a real Kafka, so the only way to know the watcher emits the
+// right wire-level data is to inspect what it handed to the publisher.
+func TestWatcher_Run_PublishesMatchedEvent(t *testing.T) {
 	wallet := domain.Wallet{
 		ID:         "w1",
 		UserID:     "u1",
@@ -131,22 +137,22 @@ func TestWatcher_Run_PersistsMatchedEvent(t *testing.T) {
 		Return([]domain.Wallet{wallet}, nil)
 
 	logsFetcher := newScriptedLogsFetcher()
-	eventRepo := &mocks.EventRepository{}
+	publisher := &mocks.BrokerPublisher{}
 
-	// Capture the first persisted event so we can assert on its fields.
-	persisted := make(chan *domain.WalletEvent, 1)
-	eventRepo.
-		On("Create", mock.Anything, mock.AnythingOfType("*domain.WalletEvent")).
+	// Capture the first published envelope so we can assert on its fields.
+	published := make(chan *broker.EventEnvelope, 1)
+	publisher.
+		On("Publish", mock.Anything, mock.AnythingOfType("*broker.EventEnvelope")).
 		Run(func(args mock.Arguments) {
-			ev := args.Get(1).(*domain.WalletEvent)
+			env := args.Get(1).(*broker.EventEnvelope)
 			select {
-			case persisted <- ev:
+			case published <- env:
 			default:
 			}
 		}).
 		Return(nil)
 
-	w := watcher.NewWatcher(logsFetcher, walletRepo, eventRepo, 20*time.Millisecond)
+	w := watcher.NewWatcher(logsFetcher, walletRepo, publisher, 20*time.Millisecond)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
@@ -154,7 +160,7 @@ func TestWatcher_Run_PersistsMatchedEvent(t *testing.T) {
 	runErr := make(chan error, 1)
 	go func() { runErr <- w.Run(ctx) }()
 
-	// Push one matching Transfer event (to=wallet) → expect one persisted event.
+	// Push one matching Transfer event (to=wallet) → expect one publish.
 	logsFetcher.push([]json.RawMessage{
 		buildTransferLog(t,
 			"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", // USDC
@@ -165,12 +171,16 @@ func TestWatcher_Run_PersistsMatchedEvent(t *testing.T) {
 	})
 
 	select {
-	case ev := <-persisted:
-		assert.Equal(t, "w1", ev.WalletID)
-		assert.Equal(t, "incoming", ev.Direction)
-		assert.Equal(t, "USDC", ev.TokenSymbol)
+	case env := <-published:
+		assert.Equal(t, "w1", env.WalletID)
+		assert.Equal(t, "incoming", env.Direction)
+		assert.Equal(t, "USDC", env.TokenSymbol)
+		assert.Equal(t, "ethereum", env.Network)
+		assert.Equal(t, broker.SchemaCurrent, env.SchemaVersion)
+		assert.NotEmpty(t, env.EventID, "event_id must be populated for downstream dedupe")
+		assert.NotEmpty(t, env.TxHash)
 	case <-time.After(1500 * time.Millisecond):
-		t.Fatalf("no event persisted within deadline")
+		t.Fatalf("no event published within deadline")
 	}
 
 	cancel()
@@ -194,9 +204,9 @@ func TestWatcher_Run_FetcherError_KeepsRunning(t *testing.T) {
 	var calls atomic.Int32
 	logsFetcher := &failingLogsFetcher{calls: &calls}
 
-	eventRepo := &mocks.EventRepository{}
+	publisher := &mocks.BrokerPublisher{}
 
-	w := watcher.NewWatcher(logsFetcher, walletRepo, eventRepo, 20*time.Millisecond)
+	w := watcher.NewWatcher(logsFetcher, walletRepo, publisher, 20*time.Millisecond)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
 	defer cancel()
@@ -214,15 +224,15 @@ func TestWatcher_Run_FetcherError_KeepsRunning(t *testing.T) {
 func TestNewWatcher_PanicsOnNilDeps(t *testing.T) {
 	goodLogs := &mocks.LogsFetcher{}
 	goodWallets := &mocks.WalletRepository{}
-	goodEvents := &mocks.EventRepository{}
+	goodPub := &mocks.BrokerPublisher{}
 
 	cases := []struct {
 		name string
 		fn   func()
 	}{
-		{"nil logsFetcher", func() { watcher.NewWatcher(nil, goodWallets, goodEvents, time.Second) }},
-		{"nil walletRepo", func() { watcher.NewWatcher(goodLogs, nil, goodEvents, time.Second) }},
-		{"nil eventRepo", func() { watcher.NewWatcher(goodLogs, goodWallets, nil, time.Second) }},
+		{"nil logsFetcher", func() { watcher.NewWatcher(nil, goodWallets, goodPub, time.Second) }},
+		{"nil walletRepo", func() { watcher.NewWatcher(goodLogs, nil, goodPub, time.Second) }},
+		{"nil publisher", func() { watcher.NewWatcher(goodLogs, goodWallets, nil, time.Second) }},
 	}
 
 	for _, c := range cases {
