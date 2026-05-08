@@ -49,15 +49,18 @@ func TestHTTPAuth_HappyPath(t *testing.T) {
 		tokens["access_token"].(string), http.StatusOK)
 	require.Contains(t, body, `"user_id"`)
 
-	// --- refresh: rotated tokens must differ from the originals
+	// --- refresh: the refresh token must rotate (it's a server-stored
+	// opaque handle; the old one is now revoked + replaced_by). The
+	// access JWT is NOT asserted to differ — claims are second-precision
+	// (iat/exp), so a refresh that lands in the same wall-clock second
+	// as login produces a byte-identical signed JWT. That's fine: JWTs
+	// are stateless in this design and the old access token was never
+	// revoked anyway.
 	rotated := httpRefresh(t, stack, tokens["refresh_token"].(string))
 	require.NotEqual(t, tokens["refresh_token"], rotated["refresh_token"])
-	require.NotEqual(t, tokens["access_token"], rotated["access_token"])
+	require.NotEmpty(t, rotated["access_token"])
 
-	// --- new access token must work; the old one was not invalidated
-	// directly (JWTs are stateless — only the refresh token is revoked
-	// in this design), but the rotated one is what the client should
-	// use going forward.
+	// --- the rotated access token must work on a protected route.
 	httpGetJSON(t, stack, "/users/"+user["id"].(string)+"/portfolio",
 		rotated["access_token"].(string), http.StatusOK)
 
@@ -148,9 +151,10 @@ func httpRegister(t *testing.T, s *authStack, email, name, password string) map[
 		"name": name, "email": email, "password": password,
 	})
 	defer resp.Body.Close()
-	require.Equal(t, http.StatusCreated, resp.StatusCode, "register: body=%s", mustReadString(t, resp))
+	raw := mustReadString(t, resp)
+	require.Equal(t, http.StatusCreated, resp.StatusCode, "register: body=%s", raw)
 	var body map[string]any
-	require.NoError(t, json.Unmarshal([]byte(mustReadString(t, resp)), &body))
+	require.NoError(t, json.Unmarshal([]byte(raw), &body))
 	require.NotEmpty(t, body["id"])
 	return body
 }
@@ -161,9 +165,10 @@ func httpLogin(t *testing.T, s *authStack, email, password string) map[string]an
 		"email": email, "password": password,
 	})
 	defer resp.Body.Close()
-	require.Equal(t, http.StatusOK, resp.StatusCode, "login: body=%s", mustReadString(t, resp))
+	raw := mustReadString(t, resp)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "login: body=%s", raw)
 	var body map[string]any
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	require.NoError(t, json.Unmarshal([]byte(raw), &body))
 	return body
 }
 
@@ -173,9 +178,10 @@ func httpRefresh(t *testing.T, s *authStack, refreshToken string) map[string]any
 		"refresh_token": refreshToken,
 	})
 	defer resp.Body.Close()
-	require.Equal(t, http.StatusOK, resp.StatusCode, "refresh: body=%s", mustReadString(t, resp))
+	raw := mustReadString(t, resp)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "refresh: body=%s", raw)
 	var body map[string]any
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	require.NoError(t, json.Unmarshal([]byte(raw), &body))
 	return body
 }
 
