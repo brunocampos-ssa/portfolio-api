@@ -27,6 +27,10 @@ build:
 	go build -o bin/portfolio-api ./cmd/api
 	go build -o bin/event-watcher ./cmd/event-watcher
 	go build -o bin/snapshot-runner ./cmd/snapshot-runner
+	go build -o bin/event-persister ./cmd/event-persister
+	go build -o bin/event-router ./cmd/event-router
+	go build -o bin/event-notifier ./cmd/event-notifier
+	go build -o bin/event-analytics ./cmd/event-analytics
 
 # Remove build artifacts
 clean:
@@ -49,6 +53,28 @@ db-reset:
 	@echo "Waiting for PostgreSQL to be ready..."
 	@sleep 3
 	@echo "Database reset complete. Migrations ran automatically."
+
+# =============================================================================
+# Module 4 Aula 2 — Brokers (Kafka + RabbitMQ).
+# =============================================================================
+
+broker-up:
+	docker compose up -d kafka rabbitmq
+	@echo "Kafka:    localhost:9092"
+	@echo "RabbitMQ: localhost:5672 (mgmt UI: http://localhost:15672, guest/guest)"
+
+broker-down:
+	docker compose stop kafka rabbitmq
+
+broker-logs:
+	docker compose logs -f kafka rabbitmq
+
+# Bring up everything the chapter needs (DB + brokers).
+infra-up:
+	docker compose up -d postgres kafka rabbitmq
+
+infra-down:
+	docker compose down
 
 # =============================================================================
 # Tests.

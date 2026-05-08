@@ -17,5 +17,61 @@ services:
       timeout: 5s
       retries: 5
 
+  # Class 2 — single-node Kafka in KRaft mode (no Zookeeper).
+  # Exposed on 9092 for host clients (watcher, event-*); 9093 is the
+  # internal controller port and stays inside the compose network.
+  # `make broker-up` brings this and rabbitmq up; `make broker-down`
+  # tears them down. Production deployments would use a managed cluster
+  # (MSK, Confluent Cloud, ...) — this is for the chapter walkthrough.
+  kafka:
+    image: bitnami/kafka:3.7
+    container_name: portfolio-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      # KRaft mode: this single node is BOTH controller and broker.
+      KAFKA_CFG_NODE_ID: "0"
+      KAFKA_CFG_PROCESS_ROLES: "controller,broker"
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: "0@kafka:9093"
+      KAFKA_CFG_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://localhost:9092"
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      # Auto-create topics so the watcher can publish to wallet.events.v1
+      # without an admin-side declaration step. Class 2 will discuss why
+      # auto-creation is fine for dev but disabled in production.
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    healthcheck:
+      test: ["CMD", "kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - kafkadata:/bitnami/kafka
+
+  # Class 2 — RabbitMQ with the management UI on 15672 (login
+  # guest/guest). The notifier subscribes through the topic exchange
+  # declared by the router on first publish.
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: portfolio-rabbitmq
+    ports:
+      - "5672:5672"   # AMQP
+      - "15672:15672" # management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+
 volumes:
   pgdata:
+  kafkadata:
+  rabbitmqdata:
