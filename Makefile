@@ -60,7 +60,8 @@ db-reset:
 
 broker-up:
 	docker compose up -d kafka rabbitmq
-	@echo "Kafka:    localhost:9092"
+	docker compose run --rm kafka-init
+	@echo "Kafka:    localhost:9092 (topic: wallet.events.v1, 3 partitions)"
 	@echo "RabbitMQ: localhost:5672 (mgmt UI: http://localhost:15672, guest/guest)"
 
 broker-down:
@@ -72,6 +73,7 @@ broker-logs:
 # Bring up everything the chapter needs (DB + brokers).
 infra-up:
 	docker compose up -d postgres kafka rabbitmq
+	docker compose run --rm kafka-init
 
 infra-down:
 	docker compose down
