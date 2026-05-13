@@ -195,29 +195,80 @@ func (w *Watcher) Run(ctx context.Context) error {
 	return ctx.Err()
 }
 
+// publishBackoffInitial / publishBackoffMax cap the per-event retry
+// pacing inside runPublishStage. Capped exponential backoff
+// (200ms, 400ms, 800ms, ..., 30s) means a sustained broker outage
+// produces at most ~2 retry attempts per minute per event, which is
+// gentle on the broker once it recovers. ctx cancellation aborts
+// the wait so SIGTERM still drains promptly.
+const (
+	publishBackoffInitial = 200 * time.Millisecond
+	publishBackoffMax     = 30 * time.Second
+)
+
 // runPublishStage drains normalized events, marshals them into broker
-// envelopes, and emits them via the configured Publisher. Errors are
-// logged and skipped — the watcher's job is to keep polling, not to
-// halt because one event could not be published. A persistent broker
-// outage will fill the upstream channel and naturally throttle the
-// poller via backpressure.
+// envelopes, and emits them via the configured Publisher. On Publish
+// error, the same event is retried with capped exponential backoff
+// until success or ctx cancel — we deliberately do NOT skip on
+// failure because doing so silently drops the event while the
+// poller continues advancing lastBlock, making the loss undetectable.
+//
+// The combination that gives us at-least-once delivery end-to-end:
+//
+//   - The poller-to-publish channel is buffered (capacity 64); when
+//     Publish blocks, the channel fills and the poller's
+//     `select { case rawLogs <- rl: case <-ctx.Done(): }` backpressures
+//     the fetch loop. lastBlock does not advance past unpublished logs.
+//   - On a transient Publish error, we retry indefinitely with backoff
+//     so the broker outage window is bridged rather than masked.
+//   - On ctx cancellation, we return immediately and the parent goroutine
+//     drains. In-flight events at shutdown are NOT acknowledged — the
+//     watcher refetches them from the chain on the next start (the chain
+//     is the source of truth; Kafka is the durable copy).
 func (w *Watcher) runPublishStage(ctx context.Context, events <-chan *domain.WalletEvent) {
 	for event := range events {
 		env := eventToEnvelope(event)
-		if err := w.publisher.Publish(ctx, env); err != nil {
-			// On ctx-cancel, drop quietly — we're shutting down.
-			if ctx.Err() != nil {
-				return
-			}
-			log.Printf("watcher: publish error: tx=%s wallet=%s err=%v",
-				truncate(event.TxHash, 10), event.WalletID, err)
-			continue
+		if !w.publishWithRetry(ctx, event, env) {
+			// ctx cancelled mid-publish; the next watcher start will
+			// re-fetch from the chain.
+			return
 		}
 		log.Printf("watcher: published event id=%s tx=%s wallet=%s direction=%s token=%s amount=%s",
 			env.EventID, truncate(event.TxHash, 10), event.WalletID,
 			event.Direction, event.TokenSymbol, event.Amount)
 	}
 	log.Println("watcher: publish stage done")
+}
+
+// publishWithRetry attempts Publish repeatedly with capped exponential
+// backoff. Returns true on success, false if ctx is cancelled before
+// success.
+func (w *Watcher) publishWithRetry(ctx context.Context, event *domain.WalletEvent, env *broker.EventEnvelope) bool {
+	backoff := publishBackoffInitial
+	attempt := 0
+	for {
+		attempt++
+		err := w.publisher.Publish(ctx, env)
+		if err == nil {
+			return true
+		}
+		if ctx.Err() != nil {
+			return false
+		}
+		log.Printf("watcher: publish attempt %d failed (will retry in %s): tx=%s wallet=%s err=%v",
+			attempt, backoff, truncate(event.TxHash, 10), event.WalletID, err)
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(backoff):
+		}
+		if backoff < publishBackoffMax {
+			backoff *= 2
+			if backoff > publishBackoffMax {
+				backoff = publishBackoffMax
+			}
+		}
+	}
 }
 
 // eventToEnvelope converts a normalized domain event into the wire
