@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 
 	"github.com/brunocampos-ssa/portfolio-api/internal/broker"
 	"github.com/brunocampos-ssa/portfolio-api/internal/contracts"
@@ -32,18 +33,21 @@ import (
 // EventRepository. Calling the handler with an envelope:
 //
 //  1. Validates the envelope has the fields the row needs. Bad
-//     envelopes return nil — there's no point retrying a malformed
-//     payload, and the kafka.Consumer's poison-pill protection has
-//     already absorbed the unparseable case. Empty required fields
-//     are logged via the returned error path so an operator can
-//     spot the producer-side bug without tying up the consumer.
+//     envelopes are logged AT WARNING and the handler returns nil
+//     so the consumer commits the offset immediately — there is no
+//     point retrying a malformed payload, and burning the retry
+//     budget on it would delay every following message.
 //  2. Converts the envelope to a domain.WalletEvent.
-//  3. Calls EventRepository.Create.
+//  3. Calls EventRepository.Create. Transient repo errors (DB
+//     connection blip, deadlock, ...) are returned to trigger the
+//     consumer's bounded retry.
 //
 // Returning nil = commit the offset. Returning an error = trigger the
 // consumer's bounded retry. We return errors only for transient
-// repo failures (DB connection blip, deadlock, ...). Validation
-// failures are NOT retried because retrying won't change them.
+// repo failures. Validation failures are NOT retried because retrying
+// won't change them; instead we log them as drops so an operator
+// scraping logs sees the producer-side bug directly (no need to
+// correlate with the consumer's "exhausted retries" line).
 func NewHandler(repo contracts.EventRepository) broker.Handler {
 	if repo == nil {
 		panic("persister.NewHandler: repo must not be nil")
@@ -55,10 +59,12 @@ func NewHandler(repo contracts.EventRepository) broker.Handler {
 			return nil
 		}
 		if err := validateForPersist(env); err != nil {
-			// Don't retry — log via returned-then-swallowed pattern.
-			// The kafka.Consumer's "exhausted retries" log line is
-			// the operator-visible signal this happened.
-			return fmt.Errorf("persister: %w", err)
+			// Don't retry — retrying won't change a malformed
+			// envelope. Log directly so the producer-side bug is
+			// visible without burning the consumer's retry budget.
+			log.Printf("persister: dropping invalid envelope event_id=%s tx=%s: %v",
+				env.EventID, env.TxHash, err)
+			return nil
 		}
 
 		event := envelopeToDomain(env)

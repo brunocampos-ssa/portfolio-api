@@ -65,39 +65,35 @@ func TestHandler_RetriesOnRepoError(t *testing.T) {
 	repo.AssertExpectations(t)
 }
 
-// TestHandler_DropsInvalidEnvelopes tests that envelopes with
+// TestHandler_DropsInvalidEnvelopes verifies that envelopes with
 // unrecoverable validation errors do NOT consume retry budget. The
-// handler returns an error (so the consumer logs it under "exhausted
-// retries" once the budget runs out), but the repo is never called.
+// handler logs the drop and returns nil so the consumer commits the
+// offset immediately and moves on. The repo is never called.
 //
-// We can't return nil here because the consumer would silently commit
-// and we'd lose visibility. Returning an error is the right shape for
-// retry-bounded systems.
+// Why nil and not an error? Because retrying a malformed payload
+// will produce the same failure deterministically — burning 3 retries
+// per bad message delays every following message in the partition.
+// The log line is the operator-visible signal of the drop.
 func TestHandler_DropsInvalidEnvelopes(t *testing.T) {
 	cases := []struct {
 		name string
 		mut  func(*broker.EventEnvelope)
-		want string
 	}{
 		{
 			name: "bad direction",
 			mut:  func(e *broker.EventEnvelope) { e.Direction = "sideways" },
-			want: "invalid direction",
 		},
 		{
 			name: "empty event_type",
 			mut:  func(e *broker.EventEnvelope) { e.EventType = "" },
-			want: "event_type",
 		},
 		{
 			name: "empty token_symbol",
 			mut:  func(e *broker.EventEnvelope) { e.TokenSymbol = "" },
-			want: "token_symbol",
 		},
 		{
 			name: "empty amount",
 			mut:  func(e *broker.EventEnvelope) { e.Amount = "" },
-			want: "amount",
 		},
 	}
 	for _, tc := range cases {
@@ -108,8 +104,8 @@ func TestHandler_DropsInvalidEnvelopes(t *testing.T) {
 			tc.mut(env)
 
 			err := h(context.Background(), env)
-			require.Error(t, err)
-			require.Contains(t, err.Error(), tc.want)
+			require.NoError(t, err,
+				"validation drops must return nil so the consumer commits without retrying")
 			repo.AssertNotCalled(t, "Create", mock.Anything, mock.Anything)
 		})
 	}
