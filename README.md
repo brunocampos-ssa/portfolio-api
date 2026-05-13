@@ -284,7 +284,8 @@ read patterns" — three Kafka consumer groups, three opposing semantics
               ┌─────────────────────────────────────┼──────────────────────────────┐
               ▼                                     ▼                              ▼
        event-persister                       event-router                   event-analytics
-       (CG: persister)                       (CG: router)                   (CG: …-UnixNano)
+       CG:                                   CG:                            CG:
+       wallet-events-persister               wallet-events-router           wallet-events-analytics-<nanos>
               │                                     │                              │
               ▼                                     ▼                              ▼
        wallet_events                       wallet.events                   in-memory map
@@ -309,8 +310,14 @@ read patterns" — three Kafka consumer groups, three opposing semantics
   (per-wallet ordering preserved), group-aware consumer with bounded
   retry (3 attempts, exponential backoff), poison-pill skip, and a
   `NewReplayConsumer` constructor that the analytics binary uses for
-  replay-from-zero semantics (unique-per-process group ID + skip
-  commits). See `internal/broker/kafka/`.
+  replay-from-zero semantics. The replay recipe combines two
+  complementary moves: (1) a unique-per-process group ID
+  (`<base>-<UnixNano>`) so the broker treats every start as a fresh
+  group and `StartOffset=FirstOffset` applies automatically — this is
+  the primary mechanism; (2) `CommitMessages` is skipped so we don't
+  leave orphan offsets in `__consumer_offsets` (visible as noise in
+  `kafka-consumer-groups.sh --list` until the broker GCs them). See
+  `internal/broker/kafka/` and section 7.8.3 of `README.pt-BR.md`.
 - **RabbitMQ adapter** — topic exchange, `Persistent` delivery, manual
   ack/nack, publisher confirms. Routing key built by `broker.RoutingKey`
   as `<network>.<direction>.<token_lowercase>`. See
@@ -455,10 +462,12 @@ order shown and build on the base code already in the repository.
 | [`module-2`](../../releases/tag/module-2) | 2 — Advanced Concurrency | Closed |
 | [`module-3-class2`](../../releases/tag/module-3-class2) | 3 — Professional Testing | Closed |
 | [`module-4-class1`](../../releases/tag/module-4-class1) | 4 — JWT + gRPC | Closed |
-| `module-4-class2` (upcoming) | 4 — Messaging (Kafka + RabbitMQ) | Current work |
-| `module-5` (planned) | 5 — Architecture & Integrations | — |
+| `module-4-class2` | 4 — Messaging (Kafka + RabbitMQ) | Closed (tag pending) |
+| `module-5` | 5 — Architecture & Integrations | Planned |
 
-Checkout any module's state with `git checkout module-<N>`.
+Checkout the state at the end of any module/class by checking out its
+tag, e.g. `git checkout module-3-class2` or `git checkout
+module-4-class1`. See the table above for the exact tag names.
 
 ---
 
