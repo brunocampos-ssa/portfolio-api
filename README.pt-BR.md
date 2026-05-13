@@ -2101,14 +2101,13 @@ make test-integration   # com Docker, valida REST e gRPC fim a fim
 
 ### 6.13 Para a Aula 2
 
-Aula 1 deliberadamente deixou tres temas em aberto, que formarao um
+Aula 1 deliberadamente deixou tres temas em aberto, que formariam um
 arco coeso para a Aula 2:
 
-1. **Refresh + Logout em gRPC**. Hoje sao REST only. A versao gRPC vai
-   exigir que os interceptors saibam diferenciar metodos publicos e
+1. **Refresh + Logout em gRPC**. Hoje sao REST only. A versao gRPC
+   exigiria que os interceptors diferenciassem metodos publicos e
    protegidos -- e eles ja sabem -- e o servico extender o
-   `AuthServiceServer` com dois RPCs. Discutiremos por que faz sentido
-   ter o mesmo servico em dois transportes.
+   `AuthServiceServer` com dois RPCs.
 2. **Observabilidade da auth**. Migrar de `log.Printf` para `slog`
    estruturado. Adicionar um log de auditoria por evento de auth
    (login OK, login fail, refresh, logout, replay detected). No gRPC,
@@ -2116,6 +2115,11 @@ arco coeso para a Aula 2:
 3. **Resiliencia**. Rate-limit em `/auth/login` para frear ataques de
    forca bruta. Block list de tokens conhecidos comprometidos
    (denylist por `jti`).
+
+**Nota retrospectiva**: Aula 2 acabou pivotando para outro tema --
+**mensageria cross-process com Kafka + RabbitMQ** (ver capitulo a
+seguir). O arco de auth-deep-dive acima fica como tema natural para
+uma futura aula ou como conjunto de desafios.
 
 ### 6.14 Fluxo Sugerido para a Aula
 
@@ -2138,6 +2142,783 @@ arco coeso para a Aula 2:
    ao vivo. Demo final: o **mesmo token funciona nos dois lados**.
 8. **Testes (~10 min)** -- abrir `auth_http_test.go` e `auth_grpc_test.go`.
    Mostrar como o teste de cross-transport amarra o final da aula.
+
+---
+
+## Modulo 4 -- Aula 2: Mensageria Cross-Process (Kafka + RabbitMQ)
+
+Esta secao documenta a **camada de mensageria** que tira o pipeline do
+Modulo 2 do espaco de processo unico e o distribui em **cinco binarios
+independentes**, comunicando-se por **dois brokers diferentes**. A
+pergunta nova nao e "como produzir eventos" -- o watcher ja sabia disso
+no Modulo 2 -- e sim "**como entregar o mesmo evento a tres
+consumidores com necessidades opostas, sem amarrar nenhum a outro no
+codigo**".
+
+### 7.1 Objetivos de Aprendizagem
+
+Ao final desta aula voce sabera:
+
+- Distinguir **Kafka** (log particionado e duravel, replay por
+  reposicionamento de offset) de **RabbitMQ** (exchange + fila +
+  routing keys), e quando preferir cada um.
+- Escrever um **envelope versionado** durador o suficiente para uma
+  primeira evolucao de schema, sem perder mensagens em consumidores
+  legados (`ErrSchemaMismatch`).
+- Desenhar uma **abstracao de broker** que isola o codigo de negocio
+  da escolha de transporte (`broker.Publisher`, `broker.Consumer`,
+  `broker.Handler`).
+- Publicar com **partition key** correta para preservar ordem por
+  carteira em particoes paralelas, e entender o trade-off (carteira
+  quente desbalanceia load).
+- Operar **tres consumer groups** no mesmo topico, cada um com
+  semantica diferente: resume (persister), bridge (router), e
+  replay-from-zero (analytics).
+- Implementar **at-least-once** com retry limitado, poison pill e
+  o trade-off do DLQ.
+- Configurar uma **topic exchange** no RabbitMQ e fazer um consumer
+  receber so o slice que lhe interessa via padrao de routing key.
+- Subir tudo localmente com `docker-compose` (Kafka em **KRaft mode**,
+  sem Zookeeper; RabbitMQ com UI de gestao).
+- Escrever **testes de integracao** que usam testcontainers para
+  validar o caminho completo, blockchain -> alert.
+
+### 7.2 Por que mensageria? (e por que agora)
+
+Modulo 2 deixou o pipeline assim, todo dentro de um processo so:
+
+```
+watcher (1 processo)
+  poller --> normalize --> FanOut --> [persistWorker, logWorker, metricsWorker]
+```
+
+Tres consumidores conviviam dentro do mesmo binario, ligados por
+canais Go. Isso e barato em CPU, simples de testar... e ruim para tres
+coisas que comecam a importar a medida que o sistema cresce:
+
+1. **Acoplamento de deploy**. Mudar `metricsWorker` exige reiniciar o
+   watcher. Cada deploy tem o risco de derrubar o pipeline inteiro.
+2. **Acoplamento de falha**. Um panic em qualquer consumidor mata o
+   processo. Boas pessoas escrevem `recover` blocks; pessoas reais
+   esquecem.
+3. **Acoplamento de escala**. Se as metricas estao demorando, eu nao
+   posso adicionar uma instancia de `metricsWorker` sem replicar
+   tambem o poller -- o que duplicaria chamadas RPC para a chain.
+
+A solucao e mover o ponto de fan-out para **fora** do processo. Em vez
+de canais, temos um broker. Em vez de tres funcoes na mesma goroutine,
+tres binarios separados, cada um deployavel, escalavel e crashavel
+independentemente.
+
+### 7.3 Por que dois brokers?
+
+Porque os tres consumidores tem necessidades de leitura **diferentes**,
+e nenhum broker unico atende a todas elegantemente.
+
+|                          | Kafka                                          | RabbitMQ                                        |
+|--------------------------|------------------------------------------------|-------------------------------------------------|
+| Modelo                   | Log particionado, append-only                  | Exchange + fila, mensagem some apos ack         |
+| Multiplos consumidores   | **Consumer groups** com offsets independentes  | **Bindings** com padrao de routing key          |
+| Replay de historico      | Trivial -- reposicionar offset                 | Nao existe (mensagem ja foi consumida)          |
+| Roteamento por conteudo  | Pobre -- consumidor filtra                     | **Excelente** -- exchange filtra                |
+| Ordem garantida          | Por particao                                   | Por fila                                        |
+| Bom para...              | "Quero ver TUDO, eventualmente reler"          | "Quero so o slice X, em tempo real"             |
+
+A divisao do trabalho:
+
+- **Kafka** e a **fonte da verdade**. O watcher publica ali, e qualquer
+  outro processo que precise do stream completo (persistir, agregar,
+  reprocessar amanha) le do log. Os tres consumer groups do nosso
+  desenho (`persister`, `router`, `analytics`) leem o stream inteiro
+  de forma independente.
+- **RabbitMQ** e **fan-out filtrado**. O `event-router` consome o
+  Kafka e re-publica numa topic exchange do RabbitMQ com routing key
+  `network.direction.token`. Consumidores como o `event-notifier`
+  se ligam por padrao (`*.incoming.*`, `*.*.usdc`, `ethereum.#`) e
+  so recebem o que lhes interessa.
+
+A frase pedagogica: **Kafka guarda; RabbitMQ entrega**.
+
+### 7.4 Topologia da Aula
+
+```
+                    [poller]
+                       |
+                    [normalize]
+                       |
+                       v
+              +-----------------+
+              | kafka.Publisher |  (partition key = wallet_id,
+              +--------+--------+   RequiredAcks = All)
+                       |
+                       v
+              wallet.events.v1 (Kafka topic, 3 particoes)
+                       |
+       +---------------+----------------+
+       |               |                |
+       v               v                v
+ +-----------+   +-----------+   +-------------+
+ | persister |   |  router   |   | analytics   |
+ | CG: ...   |   | CG: ...   |   | CG: ...-NS  |
+ | persister |   | router    |   | (unique!)   |
+ +-----+-----+   +-----+-----+   +------+------+
+       |               |                |
+       v               v                v
+ +-----------+   +-----------+   +-------------+
+ | Postgres  |   | rabbitmq. |   | map em      |
+ | wallet_   |   | Publisher |   | memoria     |
+ | events    |   +-----+-----+   | (rebuild    |
+ +-----------+         |         |  a cada     |
+                       v         |  restart)   |
+              wallet.events      +-------------+
+              (topic exchange,
+               routing keys)
+                       |
+                       v
+              +-----------------+
+              | event-notifier  |  queue bound by
+              | *.incoming.*    |  NOTIFIER_BINDING_KEY
+              +-----------------+
+```
+
+Cinco binarios em `cmd/`:
+
+- `cmd/event-watcher` -- foi rewired em `c3cdbf6`: hoje termina no
+  Kafka em vez de fanout interno. Antes era o "guarda-chuva" do
+  pipeline; agora e so o **produtor**.
+- `cmd/event-persister` -- consome o Kafka, escreve no Postgres.
+- `cmd/event-router` -- consome o Kafka, re-publica no RabbitMQ.
+- `cmd/event-analytics` -- consome o Kafka com **replay-from-zero**,
+  agrega em memoria.
+- `cmd/event-notifier` -- consome do RabbitMQ filtrado por routing key.
+
+E sete pacotes novos em `internal/`: `broker`, `broker/kafka`,
+`broker/rabbitmq`, `persister`, `router`, `notifier`, `analytics`.
+
+### 7.5 O envelope (`broker.EventEnvelope`)
+
+Centralizamos uma **estrutura unica** que serve como contrato wire
+entre todos os participantes. JSON, snake_case, com `schema_version`:
+
+```go
+type EventEnvelope struct {
+    EventID         string    `json:"event_id"`         // chave de idempotencia
+    SchemaVersion   int       `json:"schema_version"`   // = SchemaCurrent (1)
+    Network         string    `json:"network"`          // "ethereum", "klever"
+    EventType       string    `json:"event_type"`       // "transfer" (futuro: "swap", ...)
+    Direction       string    `json:"direction"`        // "incoming" | "outgoing"
+    WalletID        string    `json:"wallet_id"`
+    TokenSymbol     string    `json:"token_symbol"`     // "USDC", "ETH", ...
+    ContractAddress string    `json:"contract_address"` // disambigua chains
+    Amount          string    `json:"amount"`           // string para fugir do float
+    TxHash          string    `json:"tx_hash"`
+    BlockNumber     uint64    `json:"block_number"`
+    EmittedAt       time.Time `json:"emitted_at"`       // hora do publish, NAO do bloco
+}
+```
+
+Tres decisoes que merecem destaque em sala:
+
+- **`EventID` deterministico**. O watcher deriva o ID de
+  `(network, tx_hash, wallet_id, direction)`. Mesmo evento logico ->
+  mesmo ID, nao importa quantas vezes o Kafka re-entregue.
+  Idempotencia comeca aqui.
+
+- **`schema_version` no envelope E nos headers Kafka**. O `Unmarshal`
+  rejeita versoes desconhecidas com `ErrSchemaMismatch`. Quando algum
+  dia bumparmos `SchemaCurrent`, consumidores antigos comecam a desviar
+  para DLQ em vez de explodir.
+
+- **`Amount` como string**. Nao queremos float aqui -- divisao por 1e18
+  vira ruido com 20 casas decimais. String adia a decisao do parser
+  para quem realmente precisa (analytics parseia para float64;
+  persister guarda como string; um sistema de billing usaria
+  shopspring/decimal).
+
+`Marshal()` chama `Validate()` antes de codar; `Unmarshal()` chama
+`Validate()` depois de decodar. Os dois caminhos sao **simetricos**.
+Isso nao e estetica, e seguranca: ninguem consegue trafegar um envelope
+sem invariantes minimas satisfeitas.
+
+### 7.6 As tres abstracoes (`Publisher`, `Consumer`, `Handler`)
+
+Em `internal/broker/publisher.go`:
+
+```go
+type Publisher interface {
+    Publish(ctx context.Context, env *EventEnvelope) error
+    Close() error
+}
+
+type Consumer interface {
+    Run(ctx context.Context, handler Handler) error
+    Close() error
+}
+
+type Handler func(ctx context.Context, env *EventEnvelope) error
+```
+
+Tres tipos, e isso e **tudo** que o codigo de negocio enxerga. O
+persister recebe um `EventRepository` e devolve um `Handler`. O router
+recebe um `Publisher` (do RabbitMQ) e devolve um `Handler`. O analytics
+tem um metodo `Apply` que **ja satisfaz** `Handler`. **Ninguem importa
+`kafka-go` ou `amqp091` fora dos adaptadores**.
+
+Beneficio pratico:
+
+- O `Handler` da o ponto onde testes substituem o broker por uma funcao
+  que captura para um canal.
+- O `kafka.Consumer` e o `rabbitmq.Consumer` carregam, **cada um**, sua
+  semantica especifica (offset commit vs ack/nack/requeue) sem que o
+  handler saiba.
+
+### 7.7 Kafka como fonte da verdade
+
+#### 7.7.1 Topicos, particoes e partition key
+
+Topico: `wallet.events.v1`. O sufixo `v1` deixa espaco para um topico
+paralelo `v2` durante uma migracao de schema (escrever nos dois, migrar
+consumidores um a um, desligar v1).
+
+```bash
+make broker-up      # Kafka + RabbitMQ + cria o topico com 3 particoes
+```
+
+Tres particoes nao porque precisemos de throughput hoje, mas porque
+**uma so particao tornaria o teste de affinity de chave trivial**. Com
+3, podemos de verdade observar que duas mensagens da mesma carteira
+aterrissam na mesma particao e mantem ordem.
+
+A partition key e o `WalletID`:
+
+```go
+msg := kafkago.Message{
+    Key:   []byte(env.WalletID),
+    Value: value,
+    Headers: []kafkago.Header{
+        {Key: "schema_version", Value: fmt.Appendf(nil, "%d", env.SchemaVersion)},
+        {Key: "event_id",       Value: []byte(env.EventID)},
+    },
+}
+```
+
+Resultado: a sequencia de eventos da carteira `w_alice` chega em ordem
+ao consumidor. **Cross-wallet ordering nao e garantida** entre
+particoes -- consumidores que precisam de timeline global ordenam por
+`(block_number, event_id)` depois de ler.
+
+Custo: uma "carteira quente" deforma load entre particoes. Em producao
+trocariamos a key para algo com hash maior (talvez
+`wallet_id + bucket_hour`). Para a aula, `WalletID` e o exemplo
+didatico claro.
+
+#### 7.7.2 Consumer groups com offsets independentes
+
+O headline didatico do Kafka: **mesmo topico, multiplas leituras
+totalmente independentes**.
+
+```bash
+make broker-groups
+# --- consumer groups ---
+# wallet-events-persister
+# wallet-events-router
+# wallet-events-analytics-1715594032183219000
+#
+# --- group details (partition / offset / lag) ---
+# GROUP                          TOPIC             PARTITION CURRENT  LOG-END  LAG
+# wallet-events-persister        wallet.events.v1  0         412      412      0
+# wallet-events-persister        wallet.events.v1  1         405      405      0
+# wallet-events-router           wallet.events.v1  0         410      412      2
+# wallet-events-router           wallet.events.v1  1         403      405      2
+# ...
+```
+
+`make broker-groups` e a visualizacao ideal para a sala: alunos veem
+literalmente que dois grupos diferentes estao em offsets diferentes no
+mesmo topico, e que cada um tem seu proprio LAG. Adicionar um quarto
+consumidor seria so um novo groupID -- zero alteracao no producer.
+
+Configuracao do `kafka.NewConsumer`:
+
+```go
+r := kafkago.NewReader(kafkago.ReaderConfig{
+    Brokers:        brokers,
+    Topic:          topic,
+    GroupID:        groupID,
+    StartOffset:    kafkago.FirstOffset, // SO no primeiro start do grupo
+    MinBytes:       1,
+    MaxBytes:       10 << 20,
+    MaxWait:        time.Second,         // ctx-cancel propaga em <= 1s
+    CommitInterval: 0,                   // commit manual via CommitMessages
+})
+```
+
+Quatro escolhas, quatro pontos didaticos:
+
+- `StartOffset = FirstOffset` so age na **primeira** vez que esse grupo
+  existe. Depois, o broker resume do ultimo offset commitado. Esse e o
+  ponto que o `NewReplayConsumer` vai explorar -- secao 7.8.3.
+- `CommitInterval = 0` desliga o auto-commit. **Commit explicito apos
+  o handler terminar** e o que da semantica at-least-once.
+- `MaxWait = 1s` deixa o ctx-cancel propagar mesmo num topico ocioso.
+- `MinBytes = 1` para baixa latencia -- emitimos 1 evento por tick do
+  poller, nao precisamos esperar batch.
+
+#### 7.7.3 At-least-once: handler antes do commit
+
+```go
+for {
+    msg, err := c.reader.FetchMessage(ctx)
+    if err != nil { ... }
+
+    env, err := broker.Unmarshal(msg.Value)
+    if err != nil {
+        // poison pill: pula, mas commita para nao trancar a particao
+        c.commitOrSkip(ctx, msg)
+        continue
+    }
+
+    if err := c.invokeWithRetry(ctx, handler, env); err != nil {
+        // retry budget esgotado; ja logamos
+    }
+    c.commitOrSkip(ctx, msg)
+}
+```
+
+A ordem aqui e tudo: **handler primeiro, commit depois**. Se o processo
+morre entre rodar o handler e commitar, a proxima reentrada **re-le a
+mensagem**. Resultado liquido: handler executa **pelo menos uma vez**;
+talvez mais. Idempotencia e responsabilidade do handler, NAO do
+consumer.
+
+Cada handler implementa idempotencia a sua maneira:
+
+| Consumer            | Como deduplica                                                       |
+|---------------------|----------------------------------------------------------------------|
+| `event-persister`   | `wallet_events.id = EventID`, `ON CONFLICT (id) DO NOTHING`          |
+| `event-router`      | Stamp do `event_id` em headers AMQP; downstream dedupe (notifier)    |
+| `event-analytics`   | Nao precisa: replay-from-zero significa que duplicidade **dentro de uma execucao** e irrelevante (totais sao reconstruidos no proximo start) |
+
+#### 7.7.4 Retry limitado, poison pill, DLQ trade-off
+
+`invokeWithRetry` tenta `maxRetries=3` vezes com backoff exponencial
+(200ms, 400ms). Apos a terceira tentativa, **commita assim mesmo** e
+loga o evento.
+
+Por que commitar uma falha?
+
+Porque a alternativa -- nao commitar e ficar reciclando a mesma
+mensagem -- trava a particao **para todos os consumidores deste grupo**.
+Uma mensagem ruim pode parar 10000 mensagens boas atras dela.
+
+O lado certo dessa decisao em producao e um **DLQ topic**: copia a
+mensagem para `wallet.events.v1.dlq` antes de commitar, e tem um
+operador olhando o DLQ. Aula 2 deliberadamente nao implementa isso --
+e o exercicio natural de extensao.
+
+**Poison pill** (envelope que nao decodifica) e tratado parecido: pula
+e commita. Se o producer rolar uma versao incompativel, queremos que
+o stream continue, nao que toda a frota de consumidores trave.
+
+### 7.8 Tres consumer groups, tres padroes de leitura
+
+#### 7.8.1 `event-persister` -- resume + idempotencia
+
+```bash
+go run ./cmd/event-persister
+```
+
+```
+wallet.events.v1 (Kafka)
+       |
+       v   consumer group: wallet-events-persister
+   kafka.Consumer
+       |
+       v   *broker.EventEnvelope
+   persister.NewHandler(repo)
+       |
+       v   ON CONFLICT (id) DO NOTHING
+   wallet_events (Postgres)
+```
+
+A grande maioria do persister e wiring. O coracao:
+
+```go
+event := envelopeToDomain(env)  // EventID vira a primary key da linha
+return repo.Create(ctx, event)  // ON CONFLICT (id) DO NOTHING
+```
+
+Idempotencia se da **na coluna primary key**. Se o Kafka redeliver a
+mesma mensagem (porque o processo crashou entre `Create` e `commit`),
+a segunda tentativa retorna nil sem inserir nada.
+
+#### 7.8.2 `event-router` -- a ponte para RabbitMQ
+
+```bash
+go run ./cmd/event-router
+```
+
+```
+wallet.events.v1 (Kafka)
+       |
+       v   consumer group: wallet-events-router
+   kafka.Consumer
+       |
+       v   *broker.EventEnvelope
+   router.NewHandler(rabbitPub)
+       |
+       v   routing key: <network>.<direction>.<token>
+   rabbitmq.Publisher
+       |
+       v
+   wallet.events (RabbitMQ topic exchange)
+```
+
+Router e propositalmente uma das coisas mais finas do projeto. Em
+`internal/router/router.go`, todo o handler:
+
+```go
+return func(ctx context.Context, env *broker.EventEnvelope) error {
+    return pub.Publish(ctx, env)   // pub e o rabbitmq.Publisher
+}
+```
+
+O `rabbitmq.Publisher` se encarrega de calcular a routing key
+(`broker.RoutingKey(env)` -> `"ethereum.incoming.usdc"`), marcar a
+mensagem como `Persistent` (sobrevive ao restart do broker), e
+propagar `event_id` em headers para dedup downstream.
+
+#### 7.8.3 `event-analytics` -- replay-from-zero a cada (re)start
+
+```bash
+go run ./cmd/event-analytics
+ANALYTICS_DUMP_INTERVAL=10s go run ./cmd/event-analytics
+```
+
+```
+wallet.events.v1 (Kafka)
+       |
+       v   group: wallet-events-analytics-<UnixNano>  <-- unico por processo!
+   kafka.NewReplayConsumer
+       |   StartOffset = FirstOffset (auto, grupo eh "fresh")
+       |   commit = DESABILITADO
+       v
+   analytics.Aggregator.Apply
+       |
+       v   map[(net,dir,token,hour)] -> {count, total}
+   stdout dump (a cada ANALYTICS_DUMP_INTERVAL, default 30s)
+```
+
+A receita de replay-from-zero **nao** e uma flag do `kafka.Reader`. E
+uma combinacao de duas coisas, encapsulada em `NewReplayConsumer`:
+
+1. **GroupID unico por processo**. Concatenamos `UnixNano` no base
+   `wallet-events-analytics`. Como o broker nunca viu esse grupo
+   antes, `StartOffset = FirstOffset` se aplica automaticamente.
+2. **Sem commits**. O `commitOrSkip` ve `replay=true` e retorna sem
+   tocar `CommitMessages`. Commitar offsets que ninguem vai resumir
+   seria escrita morta no broker e poluicao em dashboards de
+   consumer-lag.
+
+```go
+func NewReplayConsumer(brokers []string, topic, baseGroupID string) (*Consumer, error) {
+    uniqueGroupID := fmt.Sprintf("%s-%d", baseGroupID, time.Now().UnixNano())
+    c, err := NewConsumer(brokers, topic, uniqueGroupID)
+    if err != nil { return nil, err }
+    c.replay = true
+    return c, nil
+}
+```
+
+E o `Aggregator`, em `internal/analytics/analytics.go`:
+
+```go
+type BucketKey struct {
+    Network, Direction, Token string
+    Hour                      time.Time   // truncado para hora UTC
+}
+
+type BucketStats struct {
+    Count       uint64
+    AmountTotal float64
+}
+
+func (a *Aggregator) Apply(_ context.Context, env *broker.EventEnvelope) error {
+    key := BucketKey{env.Network, env.Direction, env.TokenSymbol, a.hourBucket(env.EmittedAt)}
+    a.mu.Lock()
+    stats := a.buckets[key]
+    if stats == nil { stats = &BucketStats{}; a.buckets[key] = stats }
+    stats.Count++
+    stats.AmountTotal += parseAmount(env.Amount)
+    a.mu.Unlock()
+    return nil
+}
+```
+
+O ponto pedagogico central: **o estado em memoria do analytics e
+descartavel**. Crash o processo, ele acorda, le tudo de novo, e os
+numeros sao os mesmos. A **fonte da verdade e o log do Kafka**. Esse e
+o padrao "derive views from the log" em miniatura -- e a justificativa
+arquitetural por que aceitamos a complexidade adicional de Kafka.
+
+Discussao em sala:
+
+- Se o stream tem 10 anos, replay-from-zero a cada restart e absurdo.
+  O que fazer? Resposta: ou rodar com `--from-checkpoint` (estado
+  serializado periodicamente para disco/S3), ou aceitar warm-up
+  longo. Quando vale cada um? Pergunta sem resposta unica -- depende
+  da forma da agregacao.
+- `make broker-tail` mostra o stream cru desde t=0 -- exatamente o
+  mesmo que o analytics ve no startup. Util para alunos visualizarem
+  o que esta sendo "re-derivado".
+
+### 7.9 RabbitMQ para fan-out filtrado
+
+#### 7.9.1 Topic exchange + routing keys
+
+```bash
+make broker-up   # ja sobe o RabbitMQ (UI em http://localhost:15672)
+```
+
+O `event-router` publica numa **topic exchange** chamada
+`wallet.events` (sem versao no nome porque a exchange e pura
+distribuicao -- a versao vive no envelope). A routing key segue um
+formato fixo:
+
+```
+<network>.<direction>.<token>
+```
+
+Exemplos: `ethereum.incoming.usdc`, `klever.outgoing.klv`,
+`ethereum.incoming.eth`.
+
+Por que esse formato? Porque AMQP topic exchange casa routing keys com
+padroes contendo `*` (um segmento) e `#` (zero ou mais segmentos). A
+divisao em tres niveis nos da hierarquia para perguntas naturais:
+
+| Pergunta                              | Padrao do binding         |
+|---------------------------------------|---------------------------|
+| Toda atividade Ethereum               | `ethereum.#`              |
+| Qualquer USDC, em qualquer chain      | `*.*.usdc`                |
+| Entradas em qualquer chain / token    | `*.incoming.*`            |
+| Entradas USDC em Ethereum             | `ethereum.incoming.usdc`  |
+| Tudo                                  | `#`                       |
+
+Esse e o ponto que justifica RabbitMQ na arquitetura. Em Kafka esse
+filtro teria que ser feito client-side -- baixar tudo e descartar o
+que nao interessa. RabbitMQ filtra no broker.
+
+#### 7.9.2 `event-notifier` -- consumir um slice
+
+```bash
+NOTIFIER_BINDING_KEY="*.incoming.*" go run ./cmd/event-notifier
+NOTIFIER_BINDING_KEY="*.*.usdc"     NOTIFIER_QUEUE_NAME="usdc-notifier" go run ./cmd/event-notifier
+NOTIFIER_BINDING_KEY="ethereum.#"   NOTIFIER_QUEUE_NAME="eth-notifier"  go run ./cmd/event-notifier
+```
+
+Tres instancias do **mesmo binario**, com filas diferentes ligadas por
+padroes diferentes. Cada uma recebe so o slice que lhe interessa.
+Adicionar uma quarta -- "alertar sobre transferencias acima de 1M
+USDC" -- pode ser apenas mais um binding (se da para expressar a
+condicao na key) ou um campo novo no envelope.
+
+A `Notify` callback e o seam para integracao com Slack / PagerDuty /
+email. No Aula 2 e um `log.Printf`; em producao, e um cliente HTTP do
+servico de alerta:
+
+```go
+notify := func(_ context.Context, env *broker.EventEnvelope) error {
+    log.Printf("notifier[%s]: ALERT event_id=%s network=%s direction=%s token=%s ...",
+        bindingKey, env.EventID, env.Network, env.Direction, env.TokenSymbol, ...)
+    return nil
+}
+handler := notifier.NewHandler(notify)
+```
+
+Idempotencia no notifier e responsabilidade do **destino**. Slack nao
+deduplica; PagerDuty deduplica por idempotency-key. Em ambos os casos,
+o `event_id` que o router stampou nos headers AMQP serve de chave.
+
+### 7.10 docker-compose + Makefile
+
+```bash
+make broker-up      # Kafka + RabbitMQ + topico criado com 3 particoes
+make broker-down    # para os dois
+make broker-logs    # tail dos logs dos dois
+make broker-tail    # tail do topico wallet.events.v1 desde t=0
+make broker-groups  # lista grupos + offsets + lag (visualizacao chave!)
+make infra-up       # Postgres + Kafka + RabbitMQ -- tudo que a aula precisa
+```
+
+O `docker-compose.yml` sobe Kafka em **KRaft mode** (sem Zookeeper):
+
+```yaml
+kafka:
+  image: apache/kafka:3.7.0
+  environment:
+    KAFKA_NODE_ID: "0"
+    KAFKA_PROCESS_ROLES: "controller,broker"  # mesmo no faz os dois papeis
+    KAFKA_CONTROLLER_QUORUM_VOTERS: "0@kafka:9093"
+    # ... listeners ...
+```
+
+Discussao: KRaft elimina o Zookeeper e simplifica o setup para dev. Em
+producao seria pelo menos 3 nodes para tolerar falha de controller,
+mas o efeito didatico e claro -- o docker-compose tem **um servico
+kafka, nao dois (kafka + zk)**.
+
+RabbitMQ vem com o tag `:management` -- da uma UI em
+`http://localhost:15672` (guest/guest). Util para conferir
+exchanges, queues, bindings em tempo real durante a aula.
+
+### 7.11 Testes -- a piramide cruzando dois transportes
+
+A estrutura do Modulo 3 se mantem, expandida para mensageria:
+
+- **Unidade** (`internal/broker/event_test.go`,
+  `analytics/analytics_test.go`, `persister/persister_test.go`,
+  `notifier/notifier_test.go`, `router/router_test.go`) -- handlers
+  testados com envelopes feitos a mao e mocks. Sem broker, sem
+  testcontainers.
+- **Schema** (`internal/broker/event_test.go`) -- garante que o JSON
+  round-trippa, que `SchemaVersion` errada e rejeitada com
+  `ErrSchemaMismatch`, e que campos obrigatorios faltando falham fast.
+- **Integracao** (`test/integration/*_integration_test.go`, build tag
+  `integration`) -- testenv unificado, agora com Postgres + Anvil +
+  **Kafka + RabbitMQ** via testcontainers. Cada teste cria topico /
+  queue com nome unico para nao colidir.
+
+```bash
+make test-unit          # rapido, sem Docker
+make test-integration   # com Docker; ~5 min com todos os contineres
+```
+
+Headline tests (um por binario):
+
+| Teste                                                        | O que prova                                                                |
+|--------------------------------------------------------------|----------------------------------------------------------------------------|
+| `TestEventPersister_FullPath_BlockchainToDB`                 | Transferencia ERC-20 no Anvil -> watcher -> Kafka -> persister -> linha em `wallet_events`. Cinco saltos em uma assertiva |
+| `TestEventPersister_AtLeastOnceIdempotency`                   | Mesmo envelope publicado duas vezes -> uma linha so no DB                  |
+| `TestEventRouter_BridgeStream`                                | Envelopes Kafka aparecem na queue RabbitMQ ligada por `#`, routing keys corretas |
+| `TestEventNotifier_FiresOnlyOnMatchingRoutingKey`             | Binding `*.incoming.*` recebe so incoming, nao outgoing                    |
+| `TestEventNotifier_FullPipeline_BlockchainToAlert`            | A versao completa: blockchain -> Kafka -> router -> RabbitMQ -> notifier   |
+| `TestEventAnalytics_AggregatesAcrossDimensions`               | Bucketing por (network, direction, token, hour) e ortogonal                |
+| `TestEventAnalytics_RestartReplaysFromZero`                   | **A prova do replay**: publica N, run 1 ve N, run 2 (mesmo base group) **tambem ve N**. Se offsets fossem commitados, run 2 travaria. |
+| `TestKafkaConsumer_GroupsHaveIndependentOffsets`              | Dois groupIDs diferentes leem o mesmo stream independentemente             |
+| `TestKafkaPublisher_PartitionAffinityByWalletID`              | Mensagens com mesma `WalletID` aterrissam na mesma particao                |
+
+### 7.12 Decisoes de Design
+
+**Por que JSON e nao Protobuf no envelope?** Porque o aluno pode
+`make broker-tail` e ver o conteudo a olho nu. Migrar para protobuf
+quando tivermos volume e uma decisao de Modulo 5, e o `SchemaVersion`
+ja deixa o caminho aberto.
+
+**Por que `UnixNano` como sufixo do grupo de replay?** Uniqueness
+barata sem depender de UUID/hostname/PID. Dois processos colidirem em
+um mesmo nanosegundo e... improvavel. Em producao seria
+`hostname-pid-nano`, mas o sinal pedagogico fica claro com so o nano.
+
+**Por que tres particoes e nao 1 ou 10?** Tres e o menor numero que
+permite testar afinidade de chave (ver
+`TestKafkaPublisher_PartitionAffinityByWalletID`). Em producao a regra
+e "ao menos tantas particoes quanto consumidores no maior grupo" -- o
+ajuste se faz com base em throughput observado.
+
+**Por que `RoutingKey` e um helper e nao um metodo?** Porque a routing
+key e uma **funcao do envelope**, nao um estado dele. Manter como
+funcao deixa explicito que o calculo e o mesmo no producer e no
+consumer -- e centralizado num so lugar (`internal/broker/topics.go`).
+
+**Por que dois brokers no mesmo projeto?** Por insistencia didatica.
+Em producao real, muitos times escolhem **so** Kafka ou **so** RabbitMQ
+e fazem caber o caso de uso. A aula expoe os dois lado a lado para o
+aluno desenvolver intuicao de quando preferir cada um. A regra de bolso
+final: **se voce precisa de replay historico, e Kafka; se voce precisa
+de filtragem por conteudo, e RabbitMQ; se precisa dos dois, a ponte
+existe e e barata**.
+
+**Por que `RequiredAcks = All` no producer e at-least-once no
+consumer?** Combinacao classica que garante "nao perde mensagem"
+(producer espera ack de todos os ISRs) ao custo de "pode ver duplicado"
+(consumer le antes de commitar). Idempotencia no handler fecha o
+ciclo. O outro extremo (`RequiredAcks=None` + auto-commit) seria
+at-most-once -- mais rapido, mas perde mensagens em qualquer crash.
+
+### 7.13 Erros Comuns
+
+| Sintoma                                              | Causa provavel                                                                          |
+|------------------------------------------------------|-----------------------------------------------------------------------------------------|
+| `event-persister` re-insere a mesma linha            | `ON CONFLICT (id) DO NOTHING` foi removido ou `EventID` deixou de ser a primary key      |
+| `event-analytics` mostra contagens crescendo sem parar | Algum proceso esta passando o **mesmo** group ID (sem o sufixo) -- replay nao acontece e os totais acumulam entre runs |
+| Consumidor "fica parado" numa particao               | Poison pill retornando erro perpetuo. Confirmar que `Unmarshal` esta rejeitando E `commitOrSkip` esta sendo chamado |
+| Notifier perde mensagens depois de queue declarada   | `durable=false` na exchange ou na queue. Default no nosso codigo e durable; conferir customizacoes locais |
+| `make test-integration` timeout no Kafka             | `testcontainers` precisa de Docker rodando E memoria livre. Limite de 4 GB no Docker Desktop bate frequente -- subir para 8 GB |
+| Latencia alta end-to-end                             | `MaxWait = 1s` no consumer no caminho idle. Trade-off com ctx-cancel rapido. Em producao alta-throughput, reduzir |
+| Aluno publica para `wallet.events.v1` mas consumer nao recebe nada | Esqueceu `make broker-up` apos `make broker-down`; ou o `kafka-init` nao rodou e o topico nao tem particoes suficientes |
+
+### 7.14 Fluxo Sugerido para a Aula
+
+1. **Motivacao (~10 min)** -- abrir 7.2/7.3 no quadro. Por que
+   mensageria, por que **dois** brokers. Tabela comparativa.
+
+2. **Envelope (~10 min)** -- abrir `internal/broker/event.go`. JSON
+   tags, `SchemaVersion`, `Validate`. Pergunta: por que `Amount` e
+   string e nao float?
+
+3. **Abstracoes (~10 min)** -- abrir `internal/broker/publisher.go`.
+   Tres tipos. Mostrar que `persister`, `router`, `notifier`,
+   `analytics` nao importam `kafka-go` nem `amqp091-go`.
+
+4. **Watcher -> Kafka (~15 min)** -- abrir
+   `internal/broker/kafka/publisher.go`. Discutir partition key,
+   `RequiredAcks=All`, idempotencia ao nivel do producer (kafka-go
+   cuida). Rodar:
+   ```bash
+   make broker-up
+   make watcher       # em outra aba
+   make broker-tail   # ver envelopes brotando no stream
+   ```
+
+5. **`kafka.Consumer` + `event-persister` (~20 min)** -- abrir
+   `internal/broker/kafka/consumer.go`. Caminhar:
+   `FetchMessage -> handler -> commit`, retry budget, poison pill.
+   Rodar `make event-persister` e provar que linhas aparecem no DB
+   (`SELECT count(*) FROM wallet_events`).
+
+6. **Tres consumer groups, UMA demonstracao (~10 min)** -- rodar
+   tambem `make event-router` e `make event-analytics`. Depois:
+   ```bash
+   make broker-groups
+   ```
+   Tres grupos, tres offsets diferentes, tres LAGs. **Esse e o momento
+   "aha" do Kafka**.
+
+7. **RabbitMQ + notifier (~15 min)** -- mostrar a UI de management
+   (`localhost:15672`). Abrir o exchange `wallet.events`, mostrar
+   bindings. Rodar:
+   ```bash
+   NOTIFIER_BINDING_KEY="*.incoming.*" make event-notifier
+   ```
+   Aluno ve os alerts surgirem so para incoming, mesmo que router
+   esteja publicando incoming + outgoing.
+
+8. **Replay-from-zero (~15 min)** -- a parte mais surpreendente. Matar
+   o `event-analytics`, esperar 5s, subir de novo. O dump volta com
+   **todos os numeros**, mesmos de antes do restart. Como? Abrir
+   `NewReplayConsumer` e mostrar os dois trucos (unique group + no
+   commit).
+
+9. **Testes (~10 min)** -- abrir
+   `TestEventNotifier_FullPipeline_BlockchainToAlert`. Cinco saltos
+   numa unica assertiva final. Mostrar o
+   `TestEventAnalytics_RestartReplaysFromZero` como a "prova viva" da
+   semantica de replay.
+
+10. **Decisoes e duvidas (~10 min)** -- abrir 7.12 e 7.13. Trade-offs
+    abertos: DLQ ainda nao implementado; idempotencia delegada ao
+    destino do notifier; Kafka KRaft single-node so para dev. Espaco
+    para perguntas e proximos passos.
 
 ---
 
