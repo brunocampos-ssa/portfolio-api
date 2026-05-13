@@ -36,7 +36,13 @@ type RawLog struct {
 	Address     string   `json:"address"`     // contract address (emitter)
 	Topics      []string `json:"topics"`
 	Data        string   `json:"data"`
-	Removed     bool     `json:"removed"` // true if reorged out
+	// LogIndex disambiguates multiple logs emitted by the same
+	// transaction. eth_getLogs returns it as a hex string (e.g.
+	// "0x0", "0xa"). Required for EventID uniqueness when a single
+	// tx hits the same wallet/direction via multiple logs (e.g.,
+	// multi-hop swaps, aggregator txs).
+	LogIndex string `json:"logIndex"`
+	Removed  bool   `json:"removed"` // true if reorged out
 }
 
 // NormalizeTransferLog converts a raw Ethereum log into a WalletEvent.
@@ -114,6 +120,7 @@ func NormalizeTransferLog(raw RawLog, trackedAddresses map[string]string) (*doma
 		ID:              fmt.Sprintf("evt%d", time.Now().UnixNano()),
 		WalletID:        walletID,
 		TxHash:          raw.TxHash,
+		LogIndex:        raw.LogIndex,
 		BlockNumber:     blockNum,
 		ContractAddress: contractAddr,
 		EventType:       "transfer",

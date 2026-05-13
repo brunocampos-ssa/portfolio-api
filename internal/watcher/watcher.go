@@ -273,13 +273,20 @@ func (w *Watcher) publishWithRetry(ctx context.Context, event *domain.WalletEven
 
 // eventToEnvelope converts a normalized domain event into the wire
 // envelope the broker bus expects. EventID is deterministic over
-// (network, tx_hash, wallet_id, direction) so an at-least-once
-// re-delivery from upstream produces the same id, and downstream
-// consumers can dedupe on it without a full payload comparison.
+// (network, tx_hash, log_index, wallet_id, direction) so an
+// at-least-once re-delivery from upstream produces the same id, and
+// downstream consumers can dedupe on it without a full payload
+// comparison.
+//
+// log_index is what makes the EventID unique within a single
+// transaction — a multi-hop swap or aggregator tx can emit multiple
+// Transfer logs hitting the same wallet/direction; without log_index,
+// those would collide and the persister's ON CONFLICT (id) DO NOTHING
+// would silently drop the duplicates.
 func eventToEnvelope(e *domain.WalletEvent) *broker.EventEnvelope {
 	const network = "ethereum" // watcher only handles Ethereum today
 	return &broker.EventEnvelope{
-		EventID:         makeEventID(network, e.TxHash, e.WalletID, e.Direction),
+		EventID:         makeEventID(network, e.TxHash, e.LogIndex, e.WalletID, e.Direction),
 		SchemaVersion:   broker.SchemaCurrent,
 		Network:         network,
 		EventType:       e.EventType,
@@ -297,8 +304,12 @@ func eventToEnvelope(e *domain.WalletEvent) *broker.EventEnvelope {
 // makeEventID returns a stable id derived from the natural key of a
 // wallet event. SHA-256-truncated to 16 hex chars (64 bits) — plenty of
 // uniqueness for our scale and short enough to read in log lines.
-func makeEventID(network, txHash, walletID, direction string) string {
-	h := sha256.Sum256([]byte(network + "|" + txHash + "|" + walletID + "|" + direction))
+//
+// logIndex disambiguates multiple logs in the same transaction. Empty
+// values are accepted (some test fixtures don't set it) but production
+// envelopes derived from real eth_getLogs always carry it.
+func makeEventID(network, txHash, logIndex, walletID, direction string) string {
+	h := sha256.Sum256([]byte(network + "|" + txHash + "|" + logIndex + "|" + walletID + "|" + direction))
 	return "evt_" + hex.EncodeToString(h[:8])
 }
 

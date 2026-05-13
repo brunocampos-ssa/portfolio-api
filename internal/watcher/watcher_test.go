@@ -78,8 +78,17 @@ func (s *scriptedLogsFetcher) FetchLogs(ctx context.Context, _ []string, _ uint6
 
 func buildTransferLog(t *testing.T, addr, from, to, blockHex string) json.RawMessage {
 	t.Helper()
+	return buildTransferLogAt(t, "0xabc", "0x0", addr, from, to, blockHex)
+}
+
+// buildTransferLogAt builds an eth_getLogs-shaped log with explicit
+// txHash and logIndex. Used by EventID-uniqueness tests that need
+// multiple distinct logs from the same transaction.
+func buildTransferLogAt(t *testing.T, txHash, logIndex, addr, from, to, blockHex string) json.RawMessage {
+	t.Helper()
 	l := map[string]any{
-		"transactionHash": "0xabc",
+		"transactionHash": txHash,
+		"logIndex":        logIndex,
 		"blockNumber":     blockHex,
 		"address":         addr,
 		"topics": []string{
@@ -186,6 +195,85 @@ func TestWatcher_Run_PublishesMatchedEvent(t *testing.T) {
 	cancel()
 	err := <-runErr
 	require.True(t, errors.Is(err, context.Canceled))
+}
+
+// TestWatcher_Run_DistinctLogIndex_ProducesDistinctEventIDs is the
+// regression test for the EventID collision bug surfaced in PR review:
+// before this fix, the EventID derivation ignored logIndex, so two
+// Transfer logs in the SAME tx hitting the same wallet/direction
+// (e.g., aggregator txs, multi-hop swaps) collapsed to the same
+// EventID and the persister's ON CONFLICT DO NOTHING silently
+// dropped the duplicate. We now include logIndex in the hash; both
+// logs MUST produce distinct EventIDs.
+func TestWatcher_Run_DistinctLogIndex_ProducesDistinctEventIDs(t *testing.T) {
+	wallet := domain.Wallet{
+		ID:         "w1",
+		UserID:     "u1",
+		Blockchain: "ethereum",
+		Address:    "0xde0b295669a9fd93d5f28d9ec85e40f4cb697bae",
+	}
+
+	walletRepo := &mocks.WalletRepository{}
+	walletRepo.On("FindByBlockchain", mock.Anything, "ethereum").
+		Return([]domain.Wallet{wallet}, nil)
+
+	logsFetcher := newScriptedLogsFetcher()
+	publisher := &mocks.BrokerPublisher{}
+
+	published := make(chan *broker.EventEnvelope, 4)
+	publisher.
+		On("Publish", mock.Anything, mock.AnythingOfType("*broker.EventEnvelope")).
+		Run(func(args mock.Arguments) {
+			env := args.Get(1).(*broker.EventEnvelope)
+			select {
+			case published <- env:
+			default:
+			}
+		}).
+		Return(nil)
+
+	w := watcher.NewWatcher(logsFetcher, walletRepo, publisher, 20*time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- w.Run(ctx) }()
+
+	// Same tx_hash, same to=wallet, same direction (incoming), same
+	// token. The only thing differing is logIndex — yet the EventID
+	// MUST differ.
+	const sameTx = "0xdeadbeefdeadbeef"
+	const toWallet = "0x000000000000000000000000de0b295669a9fd93d5f28d9ec85e40f4cb697bae"
+	logsFetcher.push([]json.RawMessage{
+		buildTransferLogAt(t, sameTx, "0x0",
+			"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+			"0x0000000000000000000000001111111111111111111111111111111111111111",
+			toWallet, "0xa"),
+		buildTransferLogAt(t, sameTx, "0x1",
+			"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+			"0x0000000000000000000000002222222222222222222222222222222222222222",
+			toWallet, "0xa"),
+	})
+
+	var got []*broker.EventEnvelope
+	for len(got) < 2 {
+		select {
+		case env := <-published:
+			got = append(got, env)
+		case <-time.After(1500 * time.Millisecond):
+			t.Fatalf("expected 2 published envelopes, got %d", len(got))
+		}
+	}
+
+	require.Equal(t, got[0].TxHash, got[1].TxHash, "fixture sanity: both envelopes from same tx")
+	require.Equal(t, got[0].Direction, got[1].Direction, "fixture sanity: both same direction")
+	require.Equal(t, got[0].WalletID, got[1].WalletID, "fixture sanity: both hit same wallet")
+	require.NotEqual(t, got[0].EventID, got[1].EventID,
+		"EventIDs must differ when only logIndex differs — otherwise the persister's ON CONFLICT DO NOTHING silently dedupes legitimate distinct logs")
+
+	cancel()
+	<-runErr
 }
 
 // TestWatcher_Run_FetcherError_KeepsRunning verifies the watcher is resilient
