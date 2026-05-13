@@ -76,12 +76,15 @@ type EventEnvelope struct {
 	Network string `json:"network"`
 
 	// EventType is "transfer" today. Reserved for future
-	// "approval", "swap", etc. Second segment of the routing key.
+	// "approval", "swap", etc. NOT a segment of the routing key —
+	// see broker.RoutingKey for the actual format
+	// (network.direction.token).
 	EventType string `json:"event_type"`
 
 	// Direction is "incoming" or "outgoing" relative to the tracked
-	// wallet. Producers MUST normalise this — consumers depend on it for
-	// routing-key matching.
+	// wallet. Producers MUST normalise this — consumers depend on it
+	// for routing-key matching. Doubles as the SECOND segment of the
+	// RabbitMQ routing key.
 	Direction string `json:"direction"`
 
 	// WalletID is the database id of the tracked wallet this event hit.
@@ -102,9 +105,12 @@ type EventEnvelope struct {
 	// or math/big as appropriate.
 	Amount string `json:"amount"`
 
-	// TxHash is the on-chain transaction hash. The persister uses it as
-	// the idempotency key — replays are safe because the wallet_events
-	// table has a UNIQUE constraint on (tx_hash, wallet_id, direction).
+	// TxHash is the on-chain transaction hash. NOT the idempotency
+	// key by itself — a single tx can produce multiple Transfer logs
+	// hitting the same wallet (see watcher's makeEventID). Idempotency
+	// is anchored by EventID, which is the wallet_events row's
+	// PRIMARY KEY; the persister uses ON CONFLICT (id) DO NOTHING.
+	// Indexed in the DB for human-friendly lookups.
 	TxHash string `json:"tx_hash"`
 
 	// BlockNumber is the chain height the event was observed at. Useful

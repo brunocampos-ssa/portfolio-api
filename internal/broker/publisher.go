@@ -37,9 +37,11 @@ type Publisher interface {
 // the message should be retried (Kafka: don't commit offset; RabbitMQ:
 // nack with requeue).
 //
-// Class 2 lesson: handlers MUST be idempotent. The persister keys on
-// (tx_hash, wallet_id, direction); the router stamps a delivery_id in
-// RabbitMQ headers so downstream notifiers can dedupe.
+// Class 2 lesson: handlers MUST be idempotent. The persister relies on
+// the deterministic EventID as the wallet_events PRIMARY KEY (ON
+// CONFLICT (id) DO NOTHING). The RabbitMQ publisher stamps the same
+// EventID into the AMQP MessageId and an event_id header so downstream
+// notifiers can dedupe by event identity.
 type Consumer interface {
 	// Run blocks until ctx is cancelled or an unrecoverable error
 	// occurs, calling handler for every received envelope. Returning

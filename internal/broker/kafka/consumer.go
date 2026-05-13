@@ -39,10 +39,12 @@ import (
 //     commit, redelivering anything that was in flight.
 //
 // Class 2 lesson: idempotency is the HANDLER's responsibility, not
-// the consumer's. The persister keys on (tx_hash, wallet_id,
-// direction) UNIQUE. The router stamps a delivery-id header so the
-// notifier can dedupe. The analytics consumer doesn't commit at all
-// (it always replays — see event-analytics for that pattern).
+// the consumer's. The persister anchors on the deterministic EventID
+// (wallet_events PRIMARY KEY + ON CONFLICT (id) DO NOTHING). The
+// RabbitMQ publisher carries the same EventID through MessageId and
+// an event_id header so notifiers can dedupe by event identity. The
+// analytics consumer doesn't commit at all (it always replays — see
+// event-analytics for that pattern).
 
 const (
 	// maxRetries bounds same-message retry attempts before giving up
