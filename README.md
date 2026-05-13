@@ -23,8 +23,8 @@ git tag so students can check out the exact state at the end of the class.
 | 1 | **Go Deep** — memory management, pointers, `interface{}`, reflection, error wrapping, panic/recover | 4h | [`go-memory-lab`](https://github.com/brunocampos-ssa/go-memory-lab) + [`go-advanced-interfaces`](https://github.com/brunocampos-ssa/go-advanced-interfaces) |
 | 2 | **Advanced Concurrency** — channels, select, worker pools, pipelines, fan-in/fan-out, `sync`, `atomic`, `context` | 5h | This repo — tag [`module-2`](../../releases/tag/module-2) |
 | 3 | **Professional Testing** — `testing`/`testify`/`mock`, integration & concurrency tests, benchmarking & profiling | 3h | This repo — tag [`module-3-class2`](../../releases/tag/module-3-class2) |
-| 4 — Aula 1 | **JWT + gRPC** — argon2id, access + refresh tokens with rotation & replay detection, gRPC mirror of the REST API, dual-transport auth | 3h | This repo — **current state** |
-| 4 — Aula 2 | **Auth observability & resilience** — structured logging, audit, rate-limit, gRPC tracing/metrics interceptors | 3h | Upcoming — same repo |
+| 4 — Aula 1 | **JWT + gRPC** — argon2id, access + refresh tokens with rotation & replay detection, gRPC mirror of the REST API, dual-transport auth | 3h | This repo — tag [`module-4-class1`](../../releases/tag/module-4-class1) |
+| 4 — Aula 2 | **Messaging (Kafka + RabbitMQ)** — cross-process event bus, three consumer groups with opposing semantics (resume / bridge / replay-from-zero), routing-key fan-out | 3h | This repo — **current state** |
 | 5 | **Architecture & Integrations** — hexagonal architecture, custom middleware, observability (Prometheus/OpenTelemetry/Grafana), cross-platform build & Docker | 4h | Upcoming — same repo |
 
 Each tag (`module-2`, `module-3`, …) is an annotated, signed git tag pointing
@@ -51,8 +51,12 @@ and concurrency concepts land.
 
 | Command | Purpose |
 |---------|---------|
-| `cmd/api` | JSON REST API with recovery/logging/request-id middleware |
-| `cmd/event-watcher` | Long-running process: `poller → Stage → FanOut → consumers` |
+| `cmd/api` | JSON REST API + gRPC server with recovery/logging/request-id/JWT |
+| `cmd/event-watcher` | Ethereum event poller; publishes envelopes to Kafka |
+| `cmd/event-persister` | Kafka consumer group `wallet-events-persister` → `wallet_events` table |
+| `cmd/event-router` | Kafka → RabbitMQ bridge; routing key `<network>.<direction>.<token>` |
+| `cmd/event-notifier` | RabbitMQ consumer with configurable binding pattern (alerts) |
+| `cmd/event-analytics` | Kafka replay-from-zero consumer; in-memory aggregates per hour |
 | `cmd/snapshot-runner` | Batch pipeline: `Generate → WorkerPool → fan-in → persist` |
 
 ---
@@ -67,17 +71,27 @@ and concurrency concepts land.
 ### Run locally
 
 ```bash
-# 1. Start Postgres (migrations run automatically).
-make db-up
+# 1. Start Postgres + Kafka + RabbitMQ (also creates the Kafka topic).
+make infra-up                         # or `make db-up` alone for Module 2/3 work
 
-# 2. Start the REST API.
+# 2. Start the REST + gRPC API.
 make run
 
-# 3. In another terminal, run the event watcher.
+# 3. In another terminal, run the event watcher (publishes to Kafka).
 make watcher
 
-# 4. Or run the snapshot generator.
+# 4. Run any subset of the event consumers (one per terminal).
+make event-persister
+make event-router
+make event-analytics
+NOTIFIER_BINDING_KEY="*.incoming.*" make event-notifier
+
+# Or run the snapshot generator (Module 2/3 path, unrelated to the broker).
 make snapshot
+
+# Useful broker observability:
+make broker-groups                    # list Kafka consumer groups + offsets + lag
+make broker-tail                      # tail wallet.events.v1 from t=0
 ```
 
 Default REST endpoints (Module 4 Aula 1 added the `/auth/*` group and gates `/users/{id}/*` behind a JWT):
@@ -231,17 +245,134 @@ grpcurl -plaintext \
 | `upstream_timeout`  | 504 Gateway Timeout   | DeadlineExceeded      |
 | `internal_error`    | 500                   | Internal              |
 
-### What's deferred to Aula 2
+### What Aula 1 left open
 
 Refresh and Logout are **REST-only** in Class 1 (the gRPC AuthService
-exposes only Register and Login). Class 2 will round out the gRPC
-surface alongside structured logging (`slog`), an auth audit log, login
-rate limiting, and gRPC observability interceptors.
+exposes only Register and Login), and the auth layer still uses
+`log.Printf` rather than structured logging. These items were the
+original Aula 2 plan — see the retrospective note at the start of
+the Aula 2 section below for the pivot.
 
 Full teaching-grade walkthrough — argon2id internals, the two-token
 model, the rotation-and-replay narrative, and side-by-side curl/grpcurl
 demos — lives in the Portuguese [`README.pt-BR.md`](README.pt-BR.md)
 (section "Módulo 4 — Aula 1").
+
+---
+
+## Module 4 — Aula 2: Messaging (Kafka + RabbitMQ)
+
+Module 4 Class 2 takes the Module 2 in-process pipeline (watcher +
+three channel-fed consumers in one binary) and distributes it across
+**five processes communicating over two brokers**: Kafka as the
+durable source of truth, and RabbitMQ as the topic-routed fan-out for
+filtered delivery. The headline lesson is "same topic, three different
+read patterns" — three Kafka consumer groups, three opposing semantics
+(resume / bridge / replay-from-zero), all from one producer.
+
+> **Pivot note:** Module 4 Aula 1's "What's deferred to Aula 2"
+> originally promised auth observability + resilience + gRPC
+> refresh/logout. Aula 2 ended up going in a different direction —
+> messaging — so those auth-arc items remain on the wishlist for a
+> future class.
+
+### Topology
+
+```
+[poller] → [normalize] → [Kafka publisher] → wallet.events.v1
+                                                    │
+              ┌─────────────────────────────────────┼──────────────────────────────┐
+              ▼                                     ▼                              ▼
+       event-persister                       event-router                   event-analytics
+       (CG: persister)                       (CG: router)                   (CG: …-UnixNano)
+              │                                     │                              │
+              ▼                                     ▼                              ▼
+       wallet_events                       wallet.events                   in-memory map
+       (Postgres)                          (RabbitMQ topic exchange)       (replay from t=0
+                                                  │                          on every restart)
+                                                  ▼
+                                          event-notifier
+                                          (queue bound by *.incoming.*)
+```
+
+### What you get
+
+- **Envelope schema** — `broker.EventEnvelope` (JSON, snake_case) with
+  `SchemaVersion` for forward-compatible evolution and a deterministic
+  `EventID` derived from `(network, tx_hash, log_index, wallet_id,
+  direction)`. `Marshal`/`Unmarshal` are symmetric and both run
+  `Validate`. See `internal/broker/event.go`.
+- **Broker abstraction** — `broker.Publisher`, `broker.Consumer`,
+  `broker.Handler`. Business code never imports `kafka-go` or
+  `amqp091-go`. See `internal/broker/publisher.go`.
+- **Kafka adapter** — `RequiredAcks=All`, partition key = `WalletID`
+  (per-wallet ordering preserved), group-aware consumer with bounded
+  retry (3 attempts, exponential backoff), poison-pill skip, and a
+  `NewReplayConsumer` constructor that the analytics binary uses for
+  replay-from-zero semantics (unique-per-process group ID + skip
+  commits). See `internal/broker/kafka/`.
+- **RabbitMQ adapter** — topic exchange, `Persistent` delivery, manual
+  ack/nack, publisher confirms. Routing key built by `broker.RoutingKey`
+  as `<network>.<direction>.<token_lowercase>`. See
+  `internal/broker/rabbitmq/`.
+- **Three Kafka consumer groups, three read patterns:**
+  - `event-persister` — resumes from committed offsets; idempotent on
+    `EventID` as `wallet_events` PRIMARY KEY (`ON CONFLICT (id) DO NOTHING`).
+  - `event-router` — bridges Kafka → RabbitMQ, stamping the EventID
+    into AMQP `MessageId` and an `event_id` header for downstream
+    dedupe.
+  - `event-analytics` — **replays from t=0 on every restart**.
+    Aggregates `(network, direction, token, hour) → {count, total}`
+    in memory and dumps periodically to stdout. State is ephemeral by
+    design; Kafka is the source of truth.
+- **`event-notifier`** — RabbitMQ consumer; binding pattern set via
+  `NOTIFIER_BINDING_KEY` (`*.incoming.*`, `*.*.usdc`, `ethereum.#`,
+  …). Same binary serves every alerting use case.
+- **`docker-compose.yml`** — Kafka in KRaft mode (no Zookeeper) with a
+  **dual-listener config** so in-compose clients (kafka-init, kafka-tail)
+  and host clients (the Go binaries, testcontainers) both reach the
+  broker correctly. RabbitMQ ships with the management UI on
+  `http://localhost:15672` (guest/guest).
+
+### Trying it
+
+```bash
+# Bring up Postgres + Kafka + RabbitMQ + create the topic with 3 partitions.
+make infra-up
+
+# Producer.
+make watcher
+
+# Consumers (one per terminal).
+make event-persister
+make event-router
+make event-analytics
+NOTIFIER_BINDING_KEY="*.incoming.*" make event-notifier
+
+# Visualize the three consumer groups at different offsets on the same
+# topic — the "aha" moment of the lesson.
+make broker-groups
+
+# Tail the raw Kafka stream from t=0 (host-side; useful while watching
+# the watcher publish).
+make broker-tail
+```
+
+### Headline integration tests
+
+| Test | What it proves |
+|------|----------------|
+| `TestEventPersister_FullPath_BlockchainToDB` | 5-hop end-to-end: Anvil ERC-20 transfer → watcher → Kafka → persister → row in `wallet_events` |
+| `TestEventNotifier_FullPipeline_BlockchainToAlert` | The full 6-hop pipeline reaching the notifier callback |
+| `TestEventAnalytics_RestartReplaysFromZero` | First run consumes N envelopes; restart with the same base group ID **also** consumes N — proves the replay semantics (would hang if offsets were committed) |
+| `TestKafkaConsumer_GroupsHaveIndependentOffsets` | Two groupIDs read the same stream independently |
+| `TestKafkaPublisher_PartitionAffinityByWalletID` | Messages with the same `WalletID` land on the same partition (ordering guarantee) |
+
+Full teaching-grade walkthrough — broker comparison, partition-key
+trade-offs, at-least-once with bounded retry, replay-from-zero recipe,
+routing-key hierarchy, and a 10-step suggested classroom flow — lives
+in the Portuguese [`README.pt-BR.md`](README.pt-BR.md) (section "Módulo
+4 — Aula 2").
 
 ---
 
@@ -251,12 +382,23 @@ demos — lives in the Portuguese [`README.pt-BR.md`](README.pt-BR.md)
 portfolio-api/
 ├── cmd/
 │   ├── api/                       # REST + gRPC server entrypoint (Module 4)
-│   ├── event-watcher/             # Ethereum event monitor
+│   ├── event-watcher/             # Ethereum event monitor → Kafka (Module 4 Aula 2)
+│   ├── event-persister/           # Kafka consumer → Postgres (Module 4 Aula 2)
+│   ├── event-router/              # Kafka → RabbitMQ bridge (Module 4 Aula 2)
+│   ├── event-notifier/            # RabbitMQ filtered alerts (Module 4 Aula 2)
+│   ├── event-analytics/           # Kafka replay-from-zero aggregator (Module 4 Aula 2)
 │   └── snapshot-runner/           # Wallet balance snapshot generator
 ├── internal/
+│   ├── analytics/                 # In-memory event aggregator (Module 4 Aula 2)
 │   ├── auth/                      # argon2id + JWT issuer/verifier (Module 4)
 │   │   ├── argon2.go              # PHC-encoded argon2id hasher
 │   │   └── jwt.go                 # HS256 issuer/verifier + claims context
+│   ├── broker/                    # Cross-process event bus (Module 4 Aula 2)
+│   │   ├── event.go               # EventEnvelope wire format + Validate
+│   │   ├── publisher.go           # Publisher / Consumer / Handler interfaces
+│   │   ├── topics.go              # Kafka topic + group IDs, exchange, RoutingKey
+│   │   ├── kafka/                 # segmentio/kafka-go adapter (Publisher + Consumer + ReplayConsumer)
+│   │   └── rabbitmq/              # rabbitmq/amqp091-go adapter (Publisher + Consumer)
 │   ├── concurrent/                # Reusable concurrency helpers (Module 2)
 │   ├── config/                    # Environment-driven configuration
 │   ├── contracts/                 # Port interfaces (repositories & providers)
@@ -264,17 +406,20 @@ portfolio-api/
 │   ├── grpcapi/                   # gRPC server + auth interceptor (Module 4)
 │   ├── httpapi/                   # HTTP handlers & response helpers
 │   ├── middleware/                # RequestID, Logging, Recovery, JWT (Module 4)
+│   ├── notifier/                  # RabbitMQ notify Handler (Module 4 Aula 2)
+│   ├── persister/                 # Kafka → Postgres Handler (Module 4 Aula 2)
 │   ├── provider/
 │   │   ├── blockchain/            # Ethereum / Klever adapters
 │   │   └── pricing/               # CoinGecko + mock price provider
 │   ├── repository/postgres/       # Repository implementations
 │   │   └── refresh_token_repository.go  # (Module 4)
+│   ├── router/                    # Kafka → RabbitMQ bridge Handler (Module 4 Aula 2)
 │   ├── service/
 │   │   ├── auth_service.go        # Register/Login/Refresh/Logout (Module 4)
 │   │   └── portfolio_service.go
 │   ├── snapshot/                  # Snapshot runner (pipeline)
-│   ├── watcher/                   # Event watcher (pipeline + fan-out)
-│   └── testutil/                  # Shared test infrastructure (Module 3)
+│   ├── watcher/                   # Event watcher (poller → normalize → Kafka)
+│   └── testutil/                  # Shared test infrastructure (Module 3 + 4)
 ├── proto/portfolio/v1/            # .proto sources (Module 4)
 ├── gen/portfolio/v1/              # generated Go code from buf (Module 4)
 ├── examples/                      # Runnable client demos (Module 4)
@@ -286,7 +431,7 @@ portfolio-api/
 │   └── integration/               # End-to-end tests (build tag: integration)
 ├── buf.yaml                       # buf module config (Module 4)
 ├── buf.gen.yaml                   # buf codegen config (Module 4)
-├── docker-compose.yml
+├── docker-compose.yml             # Postgres + Kafka (KRaft) + RabbitMQ
 ├── Makefile
 ├── EXERCISES.md                   # Practical exercises by module
 ├── README.md                      # This file (English)
@@ -309,8 +454,8 @@ order shown and build on the base code already in the repository.
 |-----|--------|-------|
 | [`module-2`](../../releases/tag/module-2) | 2 — Advanced Concurrency | Closed |
 | [`module-3-class2`](../../releases/tag/module-3-class2) | 3 — Professional Testing | Closed |
-| `module-4-class1` (upcoming) | 4 — JWT + gRPC | Current work |
-| `module-4-class2` (planned) | 4 — Auth observability & resilience | — |
+| [`module-4-class1`](../../releases/tag/module-4-class1) | 4 — JWT + gRPC | Closed |
+| `module-4-class2` (upcoming) | 4 — Messaging (Kafka + RabbitMQ) | Current work |
 | `module-5` (planned) | 5 — Architecture & Integrations | — |
 
 Checkout any module's state with `git checkout module-<N>`.
