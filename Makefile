@@ -28,6 +28,12 @@ snapshot:
 persister:
 	go run ./cmd/event-persister
 
+# Run the event router (Kafka consumer → RabbitMQ publisher).
+# The bridge: same envelopes the persister consumes, re-published
+# onto the wallet.events topic exchange for notifiers to filter.
+router:
+	go run ./cmd/event-router
+
 # Build all binaries
 build:
 	go build -o bin/portfolio-api ./cmd/api

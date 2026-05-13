@@ -45,6 +45,11 @@ type Config struct {
 	// can validate each entry independently. Empty in test/dev when
 	// the watcher isn't being run against a real broker.
 	KafkaBrokers []string
+
+	// RabbitMQURL is the AMQP URL the router/notifier connect to.
+	// Standard amqp://user:pass@host:port/ form. Defaults to the
+	// docker-compose RabbitMQ on localhost.
+	RabbitMQURL string
 }
 
 // Load reads configuration from environment variables.
@@ -75,6 +80,7 @@ func Load() (*Config, error) {
 
 		// Messaging
 		KafkaBrokers: parseCSV("KAFKA_BROKERS", []string{"localhost:9092"}),
+		RabbitMQURL:  getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
 	}
 
 	if cfg.DatabaseURL == "" {

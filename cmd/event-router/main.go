@@ -1,31 +1,111 @@
-// event-router is the bridge between Kafka (source of truth) and
-// RabbitMQ (topic-routed notifications). It consumes the same wallet
-// events stream as the persister but on its own consumer group, then
-// re-publishes each envelope into the wallet.events topic exchange
-// with a routing key derived from the envelope.
+// event-router bridges Kafka (source of truth) to RabbitMQ (topic-
+// routed notifications). It consumes wallet.events.v1 on its own
+// consumer group and re-publishes each envelope into the
+// wallet.events topic exchange with a routing key derived from
+// (network, direction, token).
 //
-// This pattern (single source of truth + downstream forwarders) is what
-// real systems usually look like: the durable log of record is one
-// system, fan-out to "interesting subset" subscribers is another. We
-// split it explicitly so students see why — coupling the watcher to
-// both brokers would mean the watcher fails when either is down.
+// Architecture:
 //
-// Class 2 will replace this stub with:
+//   wallet.events.v1 (Kafka topic)
+//        │
+//        ▼  consumer group: wallet-events-router
+//   ┌─────────────────┐
+//   │  kafka.Consumer │
+//   └────────┬────────┘
+//            │  *broker.EventEnvelope
+//            ▼
+//   ┌─────────────────┐
+//   │ router.NewHand. │
+//   └────────┬────────┘
+//            │
+//            ▼  routing key: <network>.<direction>.<token>
+//   ┌─────────────────┐
+//   │ rabbitmq.Pub    │  Mandatory=true, confirm.select
+//   └────────┬────────┘
+//            │
+//            ▼
+//   wallet.events exchange (topic)
+//            │
+//            ▼
+//   queues bound by event-notifier and friends
 //
-//   - kafka.NewConsumer(brokers, broker.KafkaTopicWalletEvents, broker.KafkaGroupRouter)
-//   - rabbitmq.NewPublisher(url, broker.RabbitExchangeWalletEvents)
-//   - consumer.Run(ctx, func(ctx, env) error {
-//         return rabbitPublisher.Publish(ctx, env)  // routing key derived inside
-//     })
+// Two transports, one event identity. Notifiers subscribed to a
+// pattern don't care that the event came from Kafka; they just see
+// it in their queue.
 //
-// Idempotency: the notifier's queue may receive duplicates if the router
-// crashes between the publish and the Kafka offset commit. The notifier
-// is responsible for de-duping on EventID (we propagate it as an AMQP
-// header so the notifier can keep an LRU cache without parsing the body).
+// Usage:
+//   go run ./cmd/event-router
+//
+// Environment variables:
+//   KAFKA_BROKERS - Comma-separated Kafka bootstrap server list
+//   RABBITMQ_URL  - AMQP URL (amqp://user:pass@host:port/)
 package main
 
-import "log"
+import (
+	"context"
+	"errors"
+	"log"
+	"os/signal"
+	"syscall"
+
+	"github.com/brunocampos-ssa/portfolio-api/internal/broker"
+	brokerkafka "github.com/brunocampos-ssa/portfolio-api/internal/broker/kafka"
+	brokerrabbit "github.com/brunocampos-ssa/portfolio-api/internal/broker/rabbitmq"
+	"github.com/brunocampos-ssa/portfolio-api/internal/config"
+	"github.com/brunocampos-ssa/portfolio-api/internal/router"
+)
 
 func main() {
-	log.Fatal("event-router: not implemented yet (Class 2 stub)")
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("FATAL: load config: %v", err)
+	}
+
+	// --- RabbitMQ publisher (the bridge's output side) ---
+	rabbitPub, err := brokerrabbit.NewPublisher(cfg.RabbitMQURL, broker.RabbitExchangeWalletEvents)
+	if err != nil {
+		log.Fatalf("FATAL: rabbitmq publisher: %v", err)
+	}
+	defer func() {
+		if err := rabbitPub.Close(); err != nil {
+			log.Printf("warning: rabbitmq publisher close: %v", err)
+		}
+	}()
+	log.Printf("RabbitMQ publisher ready: url=%s exchange=%s",
+		cfg.RabbitMQURL, broker.RabbitExchangeWalletEvents)
+
+	// --- Kafka consumer (the bridge's input side) ---
+	kafkaCons, err := brokerkafka.NewConsumer(
+		cfg.KafkaBrokers,
+		broker.KafkaTopicWalletEvents,
+		broker.KafkaGroupRouter,
+	)
+	if err != nil {
+		log.Fatalf("FATAL: kafka consumer: %v", err)
+	}
+	defer func() {
+		if err := kafkaCons.Close(); err != nil {
+			log.Printf("warning: kafka consumer close: %v", err)
+		}
+	}()
+
+	// --- Bridge handler: trivial body, all behavior in the
+	//     publisher/consumer adapters. That separation is the
+	//     point. ---
+	handler := router.NewHandler(rabbitPub)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log.Println("Starting event router...")
+	log.Printf("  Kafka brokers:   %v", cfg.KafkaBrokers)
+	log.Printf("  Kafka topic:     %s", broker.KafkaTopicWalletEvents)
+	log.Printf("  Kafka group:     %s", broker.KafkaGroupRouter)
+	log.Printf("  Rabbit exchange: %s", broker.RabbitExchangeWalletEvents)
+
+	if err := kafkaCons.Run(ctx, handler); err != nil && !errors.Is(err, context.Canceled) {
+		log.Fatalf("FATAL: consumer error: %v", err)
+	}
+
+	log.Println("Event router stopped.")
 }
