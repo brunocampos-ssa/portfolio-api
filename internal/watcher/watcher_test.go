@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
+	"github.com/brunocampos-ssa/portfolio-api/internal/broker"
 	"github.com/brunocampos-ssa/portfolio-api/internal/domain"
 	"github.com/brunocampos-ssa/portfolio-api/internal/testutil/mocks"
 	"github.com/brunocampos-ssa/portfolio-api/internal/watcher"
@@ -77,8 +78,17 @@ func (s *scriptedLogsFetcher) FetchLogs(ctx context.Context, _ []string, _ uint6
 
 func buildTransferLog(t *testing.T, addr, from, to, blockHex string) json.RawMessage {
 	t.Helper()
+	return buildTransferLogAt(t, "0xabc", "0x0", addr, from, to, blockHex)
+}
+
+// buildTransferLogAt builds an eth_getLogs-shaped log with explicit
+// txHash and logIndex. Used by EventID-uniqueness tests that need
+// multiple distinct logs from the same transaction.
+func buildTransferLogAt(t *testing.T, txHash, logIndex, addr, from, to, blockHex string) json.RawMessage {
+	t.Helper()
 	l := map[string]any{
-		"transactionHash": "0xabc",
+		"transactionHash": txHash,
+		"logIndex":        logIndex,
 		"blockNumber":     blockHex,
 		"address":         addr,
 		"topics": []string{
@@ -103,9 +113,9 @@ func TestWatcher_Run_NoTrackedWallets_ExitsOnCtx(t *testing.T) {
 		Return([]domain.Wallet{}, nil)
 
 	logsFetcher := newScriptedLogsFetcher() // never triggered — intentional
-	eventRepo := &mocks.EventRepository{}
+	publisher := &mocks.BrokerPublisher{}
 
-	w := watcher.NewWatcher(logsFetcher, walletRepo, eventRepo, 50*time.Millisecond)
+	w := watcher.NewWatcher(logsFetcher, walletRepo, publisher, 50*time.Millisecond)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
 	defer cancel()
@@ -113,12 +123,17 @@ func TestWatcher_Run_NoTrackedWallets_ExitsOnCtx(t *testing.T) {
 	err := w.Run(ctx)
 	require.True(t, errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled))
 	walletRepo.AssertExpectations(t)
+	publisher.AssertNotCalled(t, "Publish", mock.Anything, mock.Anything)
 }
 
-// TestWatcher_Run_PersistsMatchedEvent drives a tracked wallet through the
-// full pipeline (poller → normalizer → fan-out → persist worker) and
-// verifies EventRepository.Create was invoked.
-func TestWatcher_Run_PersistsMatchedEvent(t *testing.T) {
+// TestWatcher_Run_PublishesMatchedEvent drives a tracked wallet through
+// the full pipeline (poller → normalizer → publish stage) and verifies
+// the publisher saw the event with the expected envelope shape.
+//
+// The shape assertions are the load-bearing piece: the unit test does
+// not have a real Kafka, so the only way to know the watcher emits the
+// right wire-level data is to inspect what it handed to the publisher.
+func TestWatcher_Run_PublishesMatchedEvent(t *testing.T) {
 	wallet := domain.Wallet{
 		ID:         "w1",
 		UserID:     "u1",
@@ -131,22 +146,22 @@ func TestWatcher_Run_PersistsMatchedEvent(t *testing.T) {
 		Return([]domain.Wallet{wallet}, nil)
 
 	logsFetcher := newScriptedLogsFetcher()
-	eventRepo := &mocks.EventRepository{}
+	publisher := &mocks.BrokerPublisher{}
 
-	// Capture the first persisted event so we can assert on its fields.
-	persisted := make(chan *domain.WalletEvent, 1)
-	eventRepo.
-		On("Create", mock.Anything, mock.AnythingOfType("*domain.WalletEvent")).
+	// Capture the first published envelope so we can assert on its fields.
+	published := make(chan *broker.EventEnvelope, 1)
+	publisher.
+		On("Publish", mock.Anything, mock.AnythingOfType("*broker.EventEnvelope")).
 		Run(func(args mock.Arguments) {
-			ev := args.Get(1).(*domain.WalletEvent)
+			env := args.Get(1).(*broker.EventEnvelope)
 			select {
-			case persisted <- ev:
+			case published <- env:
 			default:
 			}
 		}).
 		Return(nil)
 
-	w := watcher.NewWatcher(logsFetcher, walletRepo, eventRepo, 20*time.Millisecond)
+	w := watcher.NewWatcher(logsFetcher, walletRepo, publisher, 20*time.Millisecond)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
@@ -154,7 +169,7 @@ func TestWatcher_Run_PersistsMatchedEvent(t *testing.T) {
 	runErr := make(chan error, 1)
 	go func() { runErr <- w.Run(ctx) }()
 
-	// Push one matching Transfer event (to=wallet) → expect one persisted event.
+	// Push one matching Transfer event (to=wallet) → expect one publish.
 	logsFetcher.push([]json.RawMessage{
 		buildTransferLog(t,
 			"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", // USDC
@@ -165,17 +180,100 @@ func TestWatcher_Run_PersistsMatchedEvent(t *testing.T) {
 	})
 
 	select {
-	case ev := <-persisted:
-		assert.Equal(t, "w1", ev.WalletID)
-		assert.Equal(t, "incoming", ev.Direction)
-		assert.Equal(t, "USDC", ev.TokenSymbol)
+	case env := <-published:
+		assert.Equal(t, "w1", env.WalletID)
+		assert.Equal(t, "incoming", env.Direction)
+		assert.Equal(t, "USDC", env.TokenSymbol)
+		assert.Equal(t, "ethereum", env.Network)
+		assert.Equal(t, broker.SchemaCurrent, env.SchemaVersion)
+		assert.NotEmpty(t, env.EventID, "event_id must be populated for downstream dedupe")
+		assert.NotEmpty(t, env.TxHash)
 	case <-time.After(1500 * time.Millisecond):
-		t.Fatalf("no event persisted within deadline")
+		t.Fatalf("no event published within deadline")
 	}
 
 	cancel()
 	err := <-runErr
 	require.True(t, errors.Is(err, context.Canceled))
+}
+
+// TestWatcher_Run_DistinctLogIndex_ProducesDistinctEventIDs is the
+// regression test for the EventID collision bug surfaced in PR review:
+// before this fix, the EventID derivation ignored logIndex, so two
+// Transfer logs in the SAME tx hitting the same wallet/direction
+// (e.g., aggregator txs, multi-hop swaps) collapsed to the same
+// EventID and the persister's ON CONFLICT DO NOTHING silently
+// dropped the duplicate. We now include logIndex in the hash; both
+// logs MUST produce distinct EventIDs.
+func TestWatcher_Run_DistinctLogIndex_ProducesDistinctEventIDs(t *testing.T) {
+	wallet := domain.Wallet{
+		ID:         "w1",
+		UserID:     "u1",
+		Blockchain: "ethereum",
+		Address:    "0xde0b295669a9fd93d5f28d9ec85e40f4cb697bae",
+	}
+
+	walletRepo := &mocks.WalletRepository{}
+	walletRepo.On("FindByBlockchain", mock.Anything, "ethereum").
+		Return([]domain.Wallet{wallet}, nil)
+
+	logsFetcher := newScriptedLogsFetcher()
+	publisher := &mocks.BrokerPublisher{}
+
+	published := make(chan *broker.EventEnvelope, 4)
+	publisher.
+		On("Publish", mock.Anything, mock.AnythingOfType("*broker.EventEnvelope")).
+		Run(func(args mock.Arguments) {
+			env := args.Get(1).(*broker.EventEnvelope)
+			select {
+			case published <- env:
+			default:
+			}
+		}).
+		Return(nil)
+
+	w := watcher.NewWatcher(logsFetcher, walletRepo, publisher, 20*time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- w.Run(ctx) }()
+
+	// Same tx_hash, same to=wallet, same direction (incoming), same
+	// token. The only thing differing is logIndex — yet the EventID
+	// MUST differ.
+	const sameTx = "0xdeadbeefdeadbeef"
+	const toWallet = "0x000000000000000000000000de0b295669a9fd93d5f28d9ec85e40f4cb697bae"
+	logsFetcher.push([]json.RawMessage{
+		buildTransferLogAt(t, sameTx, "0x0",
+			"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+			"0x0000000000000000000000001111111111111111111111111111111111111111",
+			toWallet, "0xa"),
+		buildTransferLogAt(t, sameTx, "0x1",
+			"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+			"0x0000000000000000000000002222222222222222222222222222222222222222",
+			toWallet, "0xa"),
+	})
+
+	var got []*broker.EventEnvelope
+	for len(got) < 2 {
+		select {
+		case env := <-published:
+			got = append(got, env)
+		case <-time.After(1500 * time.Millisecond):
+			t.Fatalf("expected 2 published envelopes, got %d", len(got))
+		}
+	}
+
+	require.Equal(t, got[0].TxHash, got[1].TxHash, "fixture sanity: both envelopes from same tx")
+	require.Equal(t, got[0].Direction, got[1].Direction, "fixture sanity: both same direction")
+	require.Equal(t, got[0].WalletID, got[1].WalletID, "fixture sanity: both hit same wallet")
+	require.NotEqual(t, got[0].EventID, got[1].EventID,
+		"EventIDs must differ when only logIndex differs — otherwise the persister's ON CONFLICT DO NOTHING silently dedupes legitimate distinct logs")
+
+	cancel()
+	<-runErr
 }
 
 // TestWatcher_Run_FetcherError_KeepsRunning verifies the watcher is resilient
@@ -194,9 +292,9 @@ func TestWatcher_Run_FetcherError_KeepsRunning(t *testing.T) {
 	var calls atomic.Int32
 	logsFetcher := &failingLogsFetcher{calls: &calls}
 
-	eventRepo := &mocks.EventRepository{}
+	publisher := &mocks.BrokerPublisher{}
 
-	w := watcher.NewWatcher(logsFetcher, walletRepo, eventRepo, 20*time.Millisecond)
+	w := watcher.NewWatcher(logsFetcher, walletRepo, publisher, 20*time.Millisecond)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
 	defer cancel()
@@ -214,15 +312,15 @@ func TestWatcher_Run_FetcherError_KeepsRunning(t *testing.T) {
 func TestNewWatcher_PanicsOnNilDeps(t *testing.T) {
 	goodLogs := &mocks.LogsFetcher{}
 	goodWallets := &mocks.WalletRepository{}
-	goodEvents := &mocks.EventRepository{}
+	goodPub := &mocks.BrokerPublisher{}
 
 	cases := []struct {
 		name string
 		fn   func()
 	}{
-		{"nil logsFetcher", func() { watcher.NewWatcher(nil, goodWallets, goodEvents, time.Second) }},
-		{"nil walletRepo", func() { watcher.NewWatcher(goodLogs, nil, goodEvents, time.Second) }},
-		{"nil eventRepo", func() { watcher.NewWatcher(goodLogs, goodWallets, nil, time.Second) }},
+		{"nil logsFetcher", func() { watcher.NewWatcher(nil, goodWallets, goodPub, time.Second) }},
+		{"nil walletRepo", func() { watcher.NewWatcher(goodLogs, nil, goodPub, time.Second) }},
+		{"nil publisher", func() { watcher.NewWatcher(goodLogs, goodWallets, nil, time.Second) }},
 	}
 
 	for _, c := range cases {

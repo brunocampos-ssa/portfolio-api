@@ -2,12 +2,15 @@ package watcher
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
 	"time"
 
+	"github.com/brunocampos-ssa/portfolio-api/internal/broker"
 	"github.com/brunocampos-ssa/portfolio-api/internal/concurrent"
 	"github.com/brunocampos-ssa/portfolio-api/internal/contracts"
 	"github.com/brunocampos-ssa/portfolio-api/internal/domain"
@@ -20,55 +23,50 @@ import (
 // The Watcher monitors Ethereum for ERC-20 Transfer events involving wallets
 // that are tracked in the database.
 //
-// Architecture (data flow through channels):
+// Architecture (Class 2 — Kafka as event source-of-truth):
 //
-//   ┌──────────────┐     ┌─────────────┐     ┌──────────────────┐
-//   │  eth_getLogs  │ ──► │  rawLogs    │ ──► │  normalizer      │
-//   │  (poller)     │     │  chan RawLog │     │  (pipeline stage)│
-//   └──────────────┘     └─────────────┘     └───────┬──────────┘
-//                                                     │
-//                                              normalized events
-//                                                     │
-//                                              ┌──────▼──────┐
-//                                              │   fan-out    │
-//                                              └──────┬──────┘
-//                                         ┌───────────┼───────────┐
-//                                         ▼           ▼           ▼
-//                                    ┌─────────┐ ┌─────────┐ ┌─────────┐
-//                                    │ persist │ │  logger  │ │ metrics │
-//                                    └─────────┘ └─────────┘ └─────────┘
+//   ┌──────────────┐     ┌─────────────┐     ┌──────────────────┐     ┌────────────────┐
+//   │  eth_getLogs  │ ──► │  rawLogs    │ ──► │  normalizer      │ ──► │ kafka publisher │
+//   │  (poller)     │     │  chan RawLog │     │  (pipeline stage)│     │ (publish stage) │
+//   └──────────────┘     └─────────────┘     └──────────────────┘     └────────┬───────┘
+//                                                                                 │
+//                                                                          Kafka topic
+//                                                                                 │
+//                                                          ┌──────────────────────┼──────────────────────┐
+//                                                          ▼                      ▼                      ▼
+//                                                ┌──────────────────┐    ┌──────────────────┐   ┌──────────────────┐
+//                                                │ event-persister  │    │  event-router    │   │ event-analytics  │
+//                                                │ (CG: persister)  │    │ (CG: router)     │   │ (CG: analytics)  │
+//                                                └──────────────────┘    └──────────────────┘   └──────────────────┘
 //
-// CONCURRENCY CONCEPTS DEMONSTRATED:
+// Class 1 had three in-process consumers (persist/log/metrics) hanging
+// off a `concurrent.FanOut`. Class 2 collapses that into a single Kafka
+// publish stage and moves the consumers into separate processes (one
+// Kafka consumer group each — see broker/topics.go and cmd/event-*).
+// Two wins: the watcher process no longer owns persistence, and we
+// gain durability + replay because the events live in a partitioned
+// log instead of evaporating with the process.
 //
-// 1. Directional channels (<-chan, chan<-):
-//    - startPoller() returns <-chan RawLog (receive-only for consumers)
-//    - Pipeline Stage returns <-chan *WalletEvent
-//    - FanOut returns []<-chan *WalletEvent
-//    Direction enforces correct usage at compile time.
+// CONCURRENCY CONCEPTS still on display:
 //
-// 2. Channel ownership and close semantics:
-//    - The poller creates and closes rawLogs
-//    - The pipeline stage creates and closes normalized
-//    - FanOut creates and closes consumer channels
-//    Rule: only the producer (owner) closes a channel.
-//
-// 3. Advanced select:
-//    - Multiplexing between ticker, heartbeat, and ctx.Done()
-//    - The metrics worker reads from both events and a timer
-//
-// 4. Fan-out (broadcast):
-//    - Each normalized event is sent to ALL consumers
-//    - persist, log, and metrics workers each see every event
-//
-// 5. Graceful shutdown:
-//    - Context cancellation propagates through all stages
-//    - Each stage checks ctx.Done() before blocking operations
+//  1. Directional channels (<-chan, chan<-) on every stage boundary so
+//     direction is enforced at compile time.
+//  2. Channel ownership: each stage owns + closes its output. Close
+//     cascades from the poller all the way through to the publish loop.
+//  3. Advanced select in the poller — multiplexing ticker, heartbeat,
+//     and ctx.Done() with starvation-free pseudo-random fairness.
+//  4. Backpressure all the way to the wire: the publisher's
+//     synchronous WriteMessages slows the publish loop, which fills
+//     the normalize Stage's output channel, which slows the poller —
+//     a Kafka outage throttles polling instead of leaking memory.
+//  5. Graceful shutdown via context cancellation propagating through
+//     every stage.
 
 // Watcher is the main event monitoring service.
 type Watcher struct {
 	logsFetcher  contracts.LogsFetcher
 	walletRepo   contracts.WalletRepository
-	eventRepo    contracts.EventRepository
+	publisher    broker.Publisher
 	pollInterval time.Duration
 }
 
@@ -77,12 +75,15 @@ type Watcher struct {
 // Dependencies:
 //   - logsFetcher: polls Ethereum for event logs (eth_getLogs)
 //   - walletRepo: loads tracked wallet addresses from the database
-//   - eventRepo: persists detected events to the database
+//   - publisher: emits normalized events onto the broker bus (Kafka in
+//     production, an in-memory mock in unit tests). The watcher does
+//     NOT persist events directly — that responsibility moved to
+//     event-persister, a separate consumer of the same Kafka topic.
 //   - pollInterval: how often to poll for new logs
 func NewWatcher(
 	logsFetcher contracts.LogsFetcher,
 	walletRepo contracts.WalletRepository,
-	eventRepo contracts.EventRepository,
+	publisher broker.Publisher,
 	pollInterval time.Duration,
 ) *Watcher {
 	if logsFetcher == nil {
@@ -91,27 +92,28 @@ func NewWatcher(
 	if walletRepo == nil {
 		panic("watcher.NewWatcher: walletRepo must not be nil")
 	}
-	if eventRepo == nil {
-		panic("watcher.NewWatcher: eventRepo must not be nil")
+	if publisher == nil {
+		panic("watcher.NewWatcher: publisher must not be nil")
 	}
 	return &Watcher{
 		logsFetcher:  logsFetcher,
 		walletRepo:   walletRepo,
-		eventRepo:    eventRepo,
+		publisher:    publisher,
 		pollInterval: pollInterval,
 	}
 }
 
 // Run starts the watcher. It blocks until the context is cancelled.
 //
-// The data flows through a pipeline of channels:
-// 1. Poller produces raw logs → rawLogs channel
-// 2. Pipeline Stage normalizes logs → normalized channel
-// 3. FanOut broadcasts to consumers → 3 consumer channels
+// Pipeline:
+//
+//   1. Poller produces raw logs → rawLogs channel
+//   2. Stage normalizes them    → normalized channel
+//   3. Publish stage marshals + writes each event to Kafka. Synchronous —
+//      a slow broker propagates backpressure all the way to the poller.
 func (w *Watcher) Run(ctx context.Context) error {
 	log.Println("watcher: loading tracked wallets...")
 
-	// Build a lookup map: lowercase address → wallet ID.
 	trackedAddresses, err := w.loadTrackedAddresses(ctx)
 	if err != nil {
 		return fmt.Errorf("watcher: load tracked addresses: %w", err)
@@ -125,7 +127,6 @@ func (w *Watcher) Run(ctx context.Context) error {
 
 	log.Printf("watcher: tracking %d ethereum addresses", len(trackedAddresses))
 
-	// Extract addresses for the log filter.
 	addresses := make([]string, 0, len(trackedAddresses))
 	for addr := range trackedAddresses {
 		addresses = append(addresses, addr)
@@ -134,26 +135,19 @@ func (w *Watcher) Run(ctx context.Context) error {
 	// =========================================================================
 	// STAGE 1: Poller
 	//
-	// The poller goroutine periodically calls eth_getLogs and sends raw log
-	// entries into the rawLogs channel.
-	//
-	// CHANNEL OWNERSHIP: startPoller creates AND closes rawLogs.
-	// It returns <-chan RawLog (receive-only) so consumers can't close it.
+	// startPoller owns rawLogs — creates it, sends into it, and closes it
+	// on shutdown. Returns <-chan so downstream code cannot accidentally
+	// close it.
 	// =========================================================================
 	rawLogs := w.startPoller(ctx, addresses)
 
 	// =========================================================================
-	// STAGE 2: Normalizer (Pipeline Stage)
+	// STAGE 2: Normalizer
 	//
-	// Transforms raw Ethereum logs into domain WalletEvent objects.
-	// Uses concurrent.Stage — a reusable pipeline building block.
-	//
-	// The transform returns (event, keep):
-	//   - keep=true: event is a relevant Transfer for a tracked wallet
-	//   - keep=false: event is irrelevant (wrong type, not tracked, etc.)
-	//
-	// CLOSE PROPAGATION: when rawLogs closes, the stage finishes processing
-	// and closes its output. This creates a cascade through the pipeline.
+	// Filters non-Transfer logs and resolves the address → wallet_id /
+	// direction mapping. Skipped events are dropped silently. The
+	// concurrent.Stage helper handles close propagation: when rawLogs
+	// closes, the normalizer drains it and closes its output too.
 	// =========================================================================
 	normalized := concurrent.Stage(ctx, rawLogs, func(_ context.Context, raw RawLog) (*domain.WalletEvent, bool) {
 		event, err := NormalizeTransferLog(raw, trackedAddresses)
@@ -168,30 +162,155 @@ func (w *Watcher) Run(ctx context.Context) error {
 	})
 
 	// =========================================================================
-	// STAGE 3: Fan-Out (Broadcast)
+	// STAGE 3: Publish to Kafka
 	//
-	// Each normalized event is broadcast to ALL 3 consumers.
-	// This is different from a worker pool where each item goes to ONE worker.
+	// Replaces Class 1's FanOut + persist/log/metrics workers. A single
+	// goroutine drains normalized and Publishes each event onto the
+	// broker bus. The publisher's WriteMessages call is synchronous, so
+	// when Kafka is slow the publish goroutine slows, which fills the
+	// normalize stage's output channel, which slows the poller. The
+	// process never accumulates an unbounded backlog of unwritten events.
 	//
-	// Use case: the same event must be persisted, logged, AND counted.
-	// Each consumer operates independently — a slow persister doesn't block
-	// the logger (thanks to buffered channels inside FanOut).
+	// Why one goroutine and not a pool? kafka-go's Writer batches
+	// internally; multiple goroutines competing for the same Writer
+	// don't increase throughput. If we ever need parallel publish, the
+	// move is to shard the input channel by partition key, not to
+	// fan out to N goroutines on the same channel.
 	// =========================================================================
-	consumers := concurrent.FanOut(ctx, normalized, 3)
-
-	// Start consumer goroutines.
-	// Each consumer reads from its own channel — it does NOT close it.
-	// The channels are closed by FanOut when the input is exhausted.
-	go w.persistWorker(ctx, consumers[0])
-	go w.logWorker(ctx, consumers[1])
-	go w.metricsWorker(ctx, consumers[2])
+	publishDone := make(chan struct{})
+	go func() {
+		defer close(publishDone)
+		w.runPublishStage(ctx, normalized)
+	}()
 
 	log.Println("watcher: running — press Ctrl+C to stop")
 
-	// Block until context is cancelled (e.g., by SIGINT/SIGTERM).
 	<-ctx.Done()
 	log.Println("watcher: shutting down gracefully...")
+
+	// Wait for the publish goroutine to drain and exit before returning.
+	// Without this the test (and `make watcher`) can race past in-flight
+	// Publish calls, losing events that were already normalized.
+	<-publishDone
 	return ctx.Err()
+}
+
+// publishBackoffInitial / publishBackoffMax cap the per-event retry
+// pacing inside runPublishStage. Capped exponential backoff
+// (200ms, 400ms, 800ms, ..., 30s) means a sustained broker outage
+// produces at most ~2 retry attempts per minute per event, which is
+// gentle on the broker once it recovers. ctx cancellation aborts
+// the wait so SIGTERM still drains promptly.
+const (
+	publishBackoffInitial = 200 * time.Millisecond
+	publishBackoffMax     = 30 * time.Second
+)
+
+// runPublishStage drains normalized events, marshals them into broker
+// envelopes, and emits them via the configured Publisher. On Publish
+// error, the same event is retried with capped exponential backoff
+// until success or ctx cancel — we deliberately do NOT skip on
+// failure because doing so silently drops the event while the
+// poller continues advancing lastBlock, making the loss undetectable.
+//
+// The combination that gives us at-least-once delivery end-to-end:
+//
+//   - The poller-to-publish channel is buffered (capacity 64); when
+//     Publish blocks, the channel fills and the poller's
+//     `select { case rawLogs <- rl: case <-ctx.Done(): }` backpressures
+//     the fetch loop. lastBlock does not advance past unpublished logs.
+//   - On a transient Publish error, we retry indefinitely with backoff
+//     so the broker outage window is bridged rather than masked.
+//   - On ctx cancellation, we return immediately and the parent goroutine
+//     drains. In-flight events at shutdown are NOT acknowledged — the
+//     watcher refetches them from the chain on the next start (the chain
+//     is the source of truth; Kafka is the durable copy).
+func (w *Watcher) runPublishStage(ctx context.Context, events <-chan *domain.WalletEvent) {
+	for event := range events {
+		env := eventToEnvelope(event)
+		if !w.publishWithRetry(ctx, event, env) {
+			// ctx cancelled mid-publish; the next watcher start will
+			// re-fetch from the chain.
+			return
+		}
+		log.Printf("watcher: published event id=%s tx=%s wallet=%s direction=%s token=%s amount=%s",
+			env.EventID, truncate(event.TxHash, 10), event.WalletID,
+			event.Direction, event.TokenSymbol, event.Amount)
+	}
+	log.Println("watcher: publish stage done")
+}
+
+// publishWithRetry attempts Publish repeatedly with capped exponential
+// backoff. Returns true on success, false if ctx is cancelled before
+// success.
+func (w *Watcher) publishWithRetry(ctx context.Context, event *domain.WalletEvent, env *broker.EventEnvelope) bool {
+	backoff := publishBackoffInitial
+	attempt := 0
+	for {
+		attempt++
+		err := w.publisher.Publish(ctx, env)
+		if err == nil {
+			return true
+		}
+		if ctx.Err() != nil {
+			return false
+		}
+		log.Printf("watcher: publish attempt %d failed (will retry in %s): tx=%s wallet=%s err=%v",
+			attempt, backoff, truncate(event.TxHash, 10), event.WalletID, err)
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(backoff):
+		}
+		if backoff < publishBackoffMax {
+			backoff *= 2
+			if backoff > publishBackoffMax {
+				backoff = publishBackoffMax
+			}
+		}
+	}
+}
+
+// eventToEnvelope converts a normalized domain event into the wire
+// envelope the broker bus expects. EventID is deterministic over
+// (network, tx_hash, log_index, wallet_id, direction) so an
+// at-least-once re-delivery from upstream produces the same id, and
+// downstream consumers can dedupe on it without a full payload
+// comparison.
+//
+// log_index is what makes the EventID unique within a single
+// transaction — a multi-hop swap or aggregator tx can emit multiple
+// Transfer logs hitting the same wallet/direction; without log_index,
+// those would collide and the persister's ON CONFLICT (id) DO NOTHING
+// would silently drop the duplicates.
+func eventToEnvelope(e *domain.WalletEvent) *broker.EventEnvelope {
+	const network = "ethereum" // watcher only handles Ethereum today
+	return &broker.EventEnvelope{
+		EventID:         makeEventID(network, e.TxHash, e.LogIndex, e.WalletID, e.Direction),
+		SchemaVersion:   broker.SchemaCurrent,
+		Network:         network,
+		EventType:       e.EventType,
+		Direction:       e.Direction,
+		WalletID:        e.WalletID,
+		TokenSymbol:     e.TokenSymbol,
+		ContractAddress: e.ContractAddress,
+		Amount:          e.Amount,
+		TxHash:          e.TxHash,
+		BlockNumber:     e.BlockNumber,
+		EmittedAt:       time.Now().UTC(),
+	}
+}
+
+// makeEventID returns a stable id derived from the natural key of a
+// wallet event. SHA-256-truncated to 16 hex chars (64 bits) — plenty of
+// uniqueness for our scale and short enough to read in log lines.
+//
+// logIndex disambiguates multiple logs in the same transaction. Empty
+// values are accepted (some test fixtures don't set it) but production
+// envelopes derived from real eth_getLogs always carry it.
+func makeEventID(network, txHash, logIndex, walletID, direction string) string {
+	h := sha256.Sum256([]byte(network + "|" + txHash + "|" + logIndex + "|" + walletID + "|" + direction))
+	return "evt_" + hex.EncodeToString(h[:8])
 }
 
 // startPoller creates a goroutine that periodically fetches logs from Ethereum
@@ -281,85 +400,12 @@ func (w *Watcher) startPoller(ctx context.Context, addresses []string) <-chan Ra
 	return rawLogs
 }
 
-// persistWorker saves events to the database.
-//
-// IMPORTANT: this is a CONSUMER — it does NOT close the channel.
-// The channel is owned by FanOut, which closes it when the input is exhausted.
-// Closing a channel from the consumer side would cause a panic if the producer
-// tries to send to it.
-func (w *Watcher) persistWorker(ctx context.Context, events <-chan *domain.WalletEvent) {
-	for event := range events {
-		if err := w.eventRepo.Create(ctx, event); err != nil {
-			log.Printf("watcher: persist error: tx=%s err=%v",
-				truncate(event.TxHash, 10), err)
-			continue
-		}
-		log.Printf("watcher: persisted event tx=%s wallet=%s direction=%s",
-			truncate(event.TxHash, 10), event.WalletID, event.Direction)
-	}
-	log.Println("watcher: persist worker done")
-}
-
-// logWorker prints events for observability.
-func (w *Watcher) logWorker(_ context.Context, events <-chan *domain.WalletEvent) {
-	for event := range events {
-		log.Printf("watcher: [EVENT] type=%s direction=%s token=%s amount=%s tx=%s block=%d",
-			event.EventType, event.Direction, event.TokenSymbol,
-			event.Amount, truncate(event.TxHash, 10), event.BlockNumber)
-	}
-	log.Println("watcher: log worker done")
-}
-
-// metricsWorker counts events by direction for basic monitoring.
-//
-// This worker demonstrates a more complex select pattern: it reads from
-// TWO channels simultaneously — the events channel and a periodic ticker.
-func (w *Watcher) metricsWorker(ctx context.Context, events <-chan *domain.WalletEvent) {
-	incoming := 0
-	outgoing := 0
-
-	// Periodic metrics reporting.
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		// =================================================================
-		// SELECT WITH MULTIPLE SOURCES:
-		//
-		// This select reads from three different channels:
-		// 1. events: count each incoming/outgoing event
-		// 2. ticker.C: periodically report accumulated metrics
-		// 3. ctx.Done(): clean shutdown
-		//
-		// NOTE: when events is closed, the receive returns (nil, false).
-		// We detect this with the ok idiom and exit gracefully.
-		// =================================================================
-		select {
-		case event, ok := <-events:
-			if !ok {
-				// Channel closed — report final metrics and exit.
-				log.Printf("watcher: [METRICS] final — incoming=%d outgoing=%d total=%d",
-					incoming, outgoing, incoming+outgoing)
-				return
-			}
-			switch event.Direction {
-			case "incoming":
-				incoming++
-			case "outgoing":
-				outgoing++
-			}
-
-		case <-ticker.C:
-			log.Printf("watcher: [METRICS] incoming=%d outgoing=%d total=%d",
-				incoming, outgoing, incoming+outgoing)
-
-		case <-ctx.Done():
-			log.Printf("watcher: [METRICS] shutdown — incoming=%d outgoing=%d total=%d",
-				incoming, outgoing, incoming+outgoing)
-			return
-		}
-	}
-}
+// (Class 1's persistWorker, logWorker, and metricsWorker were removed
+// in Class 2. Persistence moved to cmd/event-persister, ad-hoc logging
+// moved to event-router (or any consumer), and metrics moved to
+// cmd/event-analytics — each subscribed to the same Kafka topic via
+// its own consumer group. See internal/broker/event.go for the topology
+// diagram.)
 
 // loadTrackedAddresses builds a map of lowercase Ethereum addresses → wallet IDs.
 func (w *Watcher) loadTrackedAddresses(ctx context.Context) (map[string]string, error) {

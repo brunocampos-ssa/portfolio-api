@@ -22,11 +22,35 @@ watcher:
 snapshot:
 	go run ./cmd/snapshot-runner
 
+# Run the event persister (Kafka consumer → wallet_events table).
+# Pair with `make watcher` in another terminal: events flow
+# Anvil/Ethereum → poller → Kafka → persister → Postgres.
+persister:
+	go run ./cmd/event-persister
+
+# Run the event router (Kafka consumer → RabbitMQ publisher).
+# The bridge: same envelopes the persister consumes, re-published
+# onto the wallet.events topic exchange for notifiers to filter.
+router:
+	go run ./cmd/event-router
+
+# Run the event notifier (RabbitMQ consumer → stdout alerts).
+# Override NOTIFIER_BINDING_KEY for different slices of the firehose:
+#   make notifier                                # default *.incoming.*
+#   NOTIFIER_BINDING_KEY="ethereum.#" make notifier
+#   NOTIFIER_BINDING_KEY="*.*.usdc" make notifier
+notifier:
+	go run ./cmd/event-notifier
+
 # Build all binaries
 build:
 	go build -o bin/portfolio-api ./cmd/api
 	go build -o bin/event-watcher ./cmd/event-watcher
 	go build -o bin/snapshot-runner ./cmd/snapshot-runner
+	go build -o bin/event-persister ./cmd/event-persister
+	go build -o bin/event-router ./cmd/event-router
+	go build -o bin/event-notifier ./cmd/event-notifier
+	go build -o bin/event-analytics ./cmd/event-analytics
 
 # Remove build artifacts
 clean:
@@ -49,6 +73,59 @@ db-reset:
 	@echo "Waiting for PostgreSQL to be ready..."
 	@sleep 3
 	@echo "Database reset complete. Migrations ran automatically."
+
+# Tail wallet_events from the in-compose Postgres. Counterpart to
+# `make broker-tail` for the chapter walkthrough: students run
+# `make watcher` + `make persister`, then `make db-tail` to see rows
+# materialise as the persister consumes from Kafka.
+db-tail:
+	@docker compose exec postgres psql -U postgres -d portfolio -c \
+	    "SELECT id, wallet_id, token_symbol, direction, block_number, created_at \
+	     FROM wallet_events ORDER BY created_at DESC LIMIT 20;"
+
+# =============================================================================
+# Module 4 Aula 2 — Brokers (Kafka + RabbitMQ).
+# =============================================================================
+
+broker-up:
+	docker compose up -d kafka rabbitmq
+	docker compose run --rm kafka-init
+	@echo "Kafka:    localhost:9092 (topic: wallet.events.v1, 3 partitions)"
+	@echo "RabbitMQ: localhost:5672 (mgmt UI: http://localhost:15672, guest/guest)"
+
+broker-down:
+	docker compose stop kafka rabbitmq
+
+broker-logs:
+	docker compose logs -f kafka rabbitmq
+
+# Tail the wallet.events.v1 topic from t=0 across every partition.
+# Convenient for the chapter walkthrough — run alongside `make watcher`
+# to see envelopes stream in. NOT a production consumer.
+broker-tail:
+	docker compose --profile tools run --rm kafka-tail
+
+# List Kafka consumer groups and describe each — partition assignment,
+# current offset, log-end offset, and LAG. The headline visual for the
+# kafka.Consumer step: students see persister and analytics groups
+# committed at different offsets on the same topic, proving the
+# consumer-groups-have-independent-state property.
+broker-groups:
+	@echo "--- consumer groups ---"
+	@docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+	    --bootstrap-server localhost:9092 --list
+	@echo ""
+	@echo "--- group details (partition / offset / lag) ---"
+	@docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+	    --bootstrap-server localhost:9092 --all-groups --describe || true
+
+# Bring up everything the chapter needs (DB + brokers).
+infra-up:
+	docker compose up -d postgres kafka rabbitmq
+	docker compose run --rm kafka-init
+
+infra-down:
+	docker compose down
 
 # =============================================================================
 # Tests.

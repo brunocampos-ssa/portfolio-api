@@ -17,5 +17,153 @@ services:
       timeout: 5s
       retries: 5
 
+  # Class 2 — single-node Kafka in KRaft mode (no Zookeeper) using the
+  # official Apache image. Exposed on 9092 for host clients
+  # (watcher, event-*); 9093 is the internal controller port and stays
+  # inside the compose network. `make broker-up` brings this and
+  # rabbitmq up; `make broker-down` tears them down. Production
+  # deployments would use a managed cluster (MSK, Confluent Cloud, ...)
+  # — this is for the chapter walkthrough.
+  #
+  # Why apache/kafka over bitnami/kafka? Bitnami restructured their
+  # public image distribution in 2025; the historical bitnami/kafka:3.x
+  # tags are no longer pullable from docker.io. apache/kafka is the
+  # official upstream image and is the safer long-term choice.
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: portfolio-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      # KRaft mode: this single node is BOTH controller and broker.
+      KAFKA_NODE_ID: "0"
+      KAFKA_PROCESS_ROLES: "controller,broker"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "0@kafka:9093"
+      # Dual-listener pattern: every Kafka client first connects to a
+      # bootstrap, then follows METADATA back to a specific broker by
+      # the address the broker ADVERTISES. With a single
+      # `localhost:9092` advertised listener, in-compose clients (the
+      # kafka-init and kafka-tail containers below) would be told to
+      # connect to localhost:9092 from inside their OWN container —
+      # which is their loopback, not the kafka container.
+      #
+      # The fix is to expose two listeners and advertise each with
+      # the address that the respective client population can reach:
+      #
+      #   - DOCKER://kafka:29092 → for in-compose clients
+      #   - HOST://localhost:9092 → for processes on the host
+      #
+      # INTER_BROKER_LISTENER_NAME points at DOCKER so any future
+      # multi-node cluster talks to itself by service name.
+      KAFKA_LISTENERS: "HOST://:9092,DOCKER://:29092,CONTROLLER://:9093"
+      KAFKA_ADVERTISED_LISTENERS: "HOST://localhost:9092,DOCKER://kafka:29092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,HOST:PLAINTEXT,DOCKER:PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "DOCKER"
+      # Auto-create topics is a dev-only safety net. The kafka-init
+      # service below pre-creates wallet.events.v1 with the right
+      # partition count; auto-create only kicks in if you publish to
+      # an unknown topic without going through `make broker-up`.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Required for KRaft: a stable cluster ID used at format-time.
+      CLUSTER_ID: "portfolio-cluster-0000000000000"
+    healthcheck:
+      # Healthcheck runs INSIDE the kafka container, so localhost:9092
+      # (HOST listener) is valid here — the metadata-redirect issue
+      # only bites cross-container clients.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - kafkadata:/var/lib/kafka/data
+
+  # Class 2 — one-shot init that declares the wallet.events.v1 topic
+  # with 3 partitions and replication factor 1.
+  #
+  # Why pre-create instead of relying on auto-create-topics? Because
+  # auto-created topics inherit the broker default num.partitions = 1.
+  # With one partition, the watcher's partition-key strategy (Hash on
+  # WalletID) is a no-op — every event lands on the same partition,
+  # masking the per-wallet ordering guarantee the architecture
+  # depends on.
+  #
+  # Three partitions is enough for the chapter's didactic value
+  # (you can SEE different wallets land on different partitions in
+  # the kafka-consumer-groups.sh output) without overwhelming a
+  # single broker. Production would scale this with the wallet count.
+  kafka-init:
+    image: apache/kafka:3.7.0
+    container_name: portfolio-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint:
+      - /bin/bash
+      - -ec
+      - |
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 \
+          --create --if-not-exists \
+          --topic wallet.events.v1 \
+          --partitions 3 \
+          --replication-factor 1
+        echo "kafka-init: topics ready"
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 \
+          --describe --topic wallet.events.v1
+    restart: "no"
+
+  # Class 2 — convenience consumer for the chapter walkthrough.
+  #
+  # Run alongside `make watcher` to see envelopes streaming as the
+  # watcher publishes them:
+  #
+  #   docker compose run --rm kafka-tail
+  #
+  # Reads from the beginning of wallet.events.v1 across every
+  # partition, prints the JSON value of each message. NOT a
+  # production consumer — kafka.Consumer (next implementation step)
+  # is the real, group-aware path. This exists purely so the
+  # "watcher → Kafka" wiring is observable from the host without
+  # writing a Go program to verify.
+  kafka-tail:
+    image: apache/kafka:3.7.0
+    container_name: portfolio-kafka-tail
+    profiles: ["tools"] # excluded from default `up`
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint:
+      - /opt/kafka/bin/kafka-console-consumer.sh
+      - --bootstrap-server=kafka:29092
+      - --topic=wallet.events.v1
+      - --from-beginning
+      - --property=print.timestamp=true
+      - --property=print.partition=true
+      - --property=print.headers=true
+      - --property=print.key=true
+      - --property=key.separator=|
+
+  # Class 2 — RabbitMQ with the management UI on 15672 (login
+  # guest/guest). The notifier subscribes through the topic exchange
+  # declared by the router on first publish.
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: portfolio-rabbitmq
+    ports:
+      - "5672:5672"   # AMQP
+      - "15672:15672" # management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+
 volumes:
   pgdata:
+  kafkadata:
+  rabbitmqdata:

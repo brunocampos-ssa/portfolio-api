@@ -42,7 +42,9 @@ import (
 
 	"github.com/brunocampos-ssa/portfolio-api/internal/testutil/anvil"
 	"github.com/brunocampos-ssa/portfolio-api/internal/testutil/ethutil"
+	"github.com/brunocampos-ssa/portfolio-api/internal/testutil/kafkatest"
 	"github.com/brunocampos-ssa/portfolio-api/internal/testutil/postgres"
+	"github.com/brunocampos-ssa/portfolio-api/internal/testutil/rabbittest"
 )
 
 const (
@@ -97,7 +99,27 @@ type Env struct {
 	DatabaseURL string
 	Anvil       *anvil.Handle
 	Postgres    *postgres.Handle
+	Kafka       *kafkatest.Handle
+	Rabbit      *rabbittest.Handle
 	Fixtures    Fixtures
+}
+
+// KafkaBrokers returns the bootstrap server list for the test Kafka
+// container. Empty slice on a nil Env or Env without Kafka.
+func (e *Env) KafkaBrokers() []string {
+	if e == nil || e.Kafka == nil {
+		return nil
+	}
+	return e.Kafka.Brokers
+}
+
+// RabbitURL returns the AMQP URL for the test RabbitMQ container.
+// Empty string on a nil Env or Env without RabbitMQ.
+func (e *Env) RabbitURL() string {
+	if e == nil || e.Rabbit == nil {
+		return ""
+	}
+	return e.Rabbit.URL
 }
 
 // RPCURL returns the http://host:port endpoint of the forked Anvil.
@@ -171,9 +193,19 @@ func Setup(ctx context.Context, opts ...Options) (*Env, error) {
 		h   *anvil.Handle
 		err error
 	}
+	type kafkaResult struct {
+		h   *kafkatest.Handle
+		err error
+	}
+	type rabbitResult struct {
+		h   *rabbittest.Handle
+		err error
+	}
 
 	pgCh := make(chan pgResult, 1)
 	anvilCh := make(chan anvilResult, 1)
+	kafkaCh := make(chan kafkaResult, 1)
+	rabbitCh := make(chan rabbitResult, 1)
 
 	go func() {
 		h, err := postgres.Start(bootCtx)
@@ -186,19 +218,35 @@ func Setup(ctx context.Context, opts ...Options) (*Env, error) {
 		})
 		anvilCh <- anvilResult{h, err}
 	}()
+	go func() {
+		h, err := kafkatest.Start(bootCtx)
+		kafkaCh <- kafkaResult{h, err}
+	}()
+	go func() {
+		h, err := rabbittest.Start(bootCtx)
+		rabbitCh <- rabbitResult{h, err}
+	}()
 
 	pg := <-pgCh
 	av := <-anvilCh
+	kf := <-kafkaCh
+	rb := <-rabbitCh
 
-	// cleanup is idempotent and tolerates nil handles — safe to call on any
-	// Setup failure path. Stops BOTH containers so nothing leaks when one
-	// side started successfully and the other errored.
+	// cleanup is idempotent and tolerates nil handles — safe to call on
+	// any Setup failure path. Stops EVERY container so nothing leaks
+	// when one side starts successfully and another errors.
 	cleanup := func() {
 		if av.h != nil {
 			_ = av.h.Stop(context.Background())
 		}
 		if pg.h != nil {
 			_ = pg.h.Stop(context.Background())
+		}
+		if kf.h != nil {
+			_ = kf.h.Stop(context.Background())
+		}
+		if rb.h != nil {
+			_ = rb.h.Stop(context.Background())
 		}
 	}
 	if pg.err != nil {
@@ -208,6 +256,14 @@ func Setup(ctx context.Context, opts ...Options) (*Env, error) {
 	if av.err != nil {
 		cleanup()
 		return nil, fmt.Errorf("testenv.Setup: anvil fork: %w", av.err)
+	}
+	if kf.err != nil {
+		cleanup()
+		return nil, fmt.Errorf("testenv.Setup: kafka: %w", kf.err)
+	}
+	if rb.err != nil {
+		cleanup()
+		return nil, fmt.Errorf("testenv.Setup: rabbitmq: %w", rb.err)
 	}
 
 	db, err := sql.Open("postgres", pg.h.DSN)
@@ -247,6 +303,8 @@ func Setup(ctx context.Context, opts ...Options) (*Env, error) {
 		DatabaseURL: pg.h.DSN,
 		Anvil:       av.h,
 		Postgres:    pg.h,
+		Kafka:       kf.h,
+		Rabbit:      rb.h,
 		Fixtures:    fx,
 	}
 
@@ -280,6 +338,12 @@ func (e *Env) Close(ctx context.Context) error {
 	}
 	if e.Postgres != nil {
 		capture(e.Postgres.Stop(ctx))
+	}
+	if e.Kafka != nil {
+		capture(e.Kafka.Stop(ctx))
+	}
+	if e.Rabbit != nil {
+		capture(e.Rabbit.Stop(ctx))
 	}
 	return firstErr
 }

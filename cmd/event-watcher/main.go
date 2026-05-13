@@ -9,6 +9,8 @@ import (
 
 	_ "github.com/lib/pq"
 
+	"github.com/brunocampos-ssa/portfolio-api/internal/broker"
+	brokerkafka "github.com/brunocampos-ssa/portfolio-api/internal/broker/kafka"
 	"github.com/brunocampos-ssa/portfolio-api/internal/config"
 	"github.com/brunocampos-ssa/portfolio-api/internal/provider/blockchain"
 	"github.com/brunocampos-ssa/portfolio-api/internal/repository/postgres"
@@ -19,24 +21,23 @@ import (
 // Event Watcher — Ethereum ERC-20 Transfer Monitor
 // =============================================================================
 //
-// This binary monitors the Ethereum blockchain for ERC-20 Transfer events
-// involving wallets tracked in the PostgreSQL database.
+// Class 2: this binary now produces events onto a Kafka topic instead
+// of persisting them itself. Persistence, alerting, and analytics are
+// split into separate consumer-group binaries (cmd/event-persister,
+// cmd/event-router, cmd/event-analytics).
 //
-// It demonstrates advanced concurrency patterns:
-//   - Directional channels (chan<-, <-chan)
-//   - Pipeline stages with channel ownership
-//   - select with ctx.Done(), ticker, and heartbeat
-//   - Fan-out (broadcast) to multiple consumers
-//   - Graceful shutdown via OS signal handling
+// The watcher still talks to Postgres because it needs to load the set
+// of tracked wallet addresses. It does NOT touch wallet_events.
 //
 // Usage:
 //   go run ./cmd/event-watcher
 //
 // Environment variables:
-//   DATABASE_URL         - PostgreSQL connection string
-//   ETH_RPC_URL          - Ethereum JSON-RPC endpoint
+//   DATABASE_URL          - PostgreSQL connection string
+//   ETH_RPC_URL           - Ethereum JSON-RPC endpoint
 //   WATCHER_POLL_INTERVAL - Polling interval (e.g., "15s", "1m")
-//   WATCHER_START_BLOCK  - Block number to start from (0 = latest)
+//   WATCHER_START_BLOCK   - Block number to start from (0 = latest)
+//   KAFKA_BROKERS         - Comma-separated Kafka bootstrap server list
 
 func main() {
 	// --- Configuration ---
@@ -45,7 +46,7 @@ func main() {
 		log.Fatalf("FATAL: load config: %v", err)
 	}
 
-	// --- Database ---
+	// --- Database (wallet metadata only — no event persistence) ---
 	db, err := sql.Open("postgres", cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("FATAL: open database: %v", err)
@@ -57,19 +58,28 @@ func main() {
 	}
 	log.Println("Connected to PostgreSQL")
 
+	// --- Kafka publisher ---
+	publisher, err := brokerkafka.NewPublisher(cfg.KafkaBrokers, broker.KafkaTopicWalletEvents)
+	if err != nil {
+		log.Fatalf("FATAL: kafka publisher: %v", err)
+	}
+	defer func() {
+		if err := publisher.Close(); err != nil {
+			log.Printf("warning: kafka publisher close: %v", err)
+		}
+	}()
+	log.Printf("Kafka publisher ready: brokers=%v topic=%s", cfg.KafkaBrokers, broker.KafkaTopicWalletEvents)
+
 	// --- Dependencies ---
 	walletRepo := postgres.NewWalletRepository(db)
-	eventRepo := postgres.NewEventRepository(db)
 	logsFetcher := blockchain.NewEthereumLogsFetcher(cfg.EthRPCURL)
 
 	// --- Watcher ---
-	w := watcher.NewWatcher(logsFetcher, walletRepo, eventRepo, cfg.WatcherPollInterval)
+	w := watcher.NewWatcher(logsFetcher, walletRepo, publisher, cfg.WatcherPollInterval)
 
 	// --- Graceful shutdown ---
-	// Create a context that is cancelled when the process receives
-	// SIGINT (Ctrl+C) or SIGTERM (Docker stop).
-	// This context propagates cancellation through the entire pipeline:
-	// poller → normalizer → fan-out → consumers
+	// SIGINT (Ctrl+C) and SIGTERM (Docker stop) cancel the root context;
+	// cancellation cascades through poller → normalizer → publish stage.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -77,8 +87,8 @@ func main() {
 	log.Printf("  ETH RPC:        %s", cfg.EthRPCURL)
 	log.Printf("  Poll interval:  %s", cfg.WatcherPollInterval)
 	log.Printf("  Start block:    %d (0 = latest)", cfg.WatcherStartBlock)
+	log.Printf("  Kafka brokers:  %v", cfg.KafkaBrokers)
 
-	// Run blocks until context is cancelled.
 	if err := w.Run(ctx); err != nil && err != context.Canceled {
 		log.Fatalf("FATAL: watcher error: %v", err)
 	}
