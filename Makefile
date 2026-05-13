@@ -34,6 +34,14 @@ persister:
 router:
 	go run ./cmd/event-router
 
+# Run the event notifier (RabbitMQ consumer → stdout alerts).
+# Override NOTIFIER_BINDING_KEY for different slices of the firehose:
+#   make notifier                                # default *.incoming.*
+#   NOTIFIER_BINDING_KEY="ethereum.#" make notifier
+#   NOTIFIER_BINDING_KEY="*.*.usdc" make notifier
+notifier:
+	go run ./cmd/event-notifier
+
 # Build all binaries
 build:
 	go build -o bin/portfolio-api ./cmd/api
