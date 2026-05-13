@@ -68,8 +68,9 @@ const (
 //   - StartOffset = FirstOffset: applied only on the FIRST run of a
 //     fresh group. Subsequent process starts resume from committed
 //     offsets. The persister catches up on history; the analytics
-//     consumer (in a future commit) overrides this so it always
-//     replays from the beginning.
+//     consumer is built via NewReplayConsumer, which gives it a
+//     unique-per-process group ID so it's ALWAYS a fresh group and
+//     therefore always replays from the beginning.
 //
 //   - CommitInterval = 0: kafka-go's auto-commit is disabled. Commits
 //     happen explicitly via CommitMessages after the handler returns
@@ -86,6 +87,13 @@ type Consumer struct {
 	brokers []string
 	topic   string
 	groupID string
+
+	// replay disables CommitMessages. Set by NewReplayConsumer: the
+	// analytics consumer doesn't track offsets because its group ID
+	// is unique per process and nobody will ever resume from them.
+	// Committing would be wasted broker writes that suggest a
+	// resumable model the binary doesn't intend to offer.
+	replay bool
 
 	reader *kafkago.Reader
 }
@@ -123,6 +131,38 @@ func NewConsumer(brokers []string, topic, groupID string) (*Consumer, error) {
 	}, nil
 }
 
+// NewReplayConsumer builds a consumer that ALWAYS replays the topic
+// from the earliest available offset on every process start. It's the
+// pattern the analytics binary needs: each restart recomputes its
+// running totals from t=0, so persistent offsets would be actively
+// wrong.
+//
+// Two mechanisms make that work:
+//
+//  1. The group ID is unique-per-process: baseGroupID + "-" + nanos.
+//     Kafka treats it as a brand-new group, so StartOffset=FirstOffset
+//     kicks in. This is the same trick a kubectl-restarted pod uses
+//     to "rewind" itself — no manual seek required.
+//
+//  2. CommitMessages is skipped (replay=true). Committing would write
+//     offsets nobody will ever read (the group ID won't exist next
+//     restart), which is wasteful and misleading in broker dashboards.
+//
+// The base group ID is exposed in logs and metrics so an operator can
+// still distinguish the analytics fleet from other consumer groups.
+func NewReplayConsumer(brokers []string, topic, baseGroupID string) (*Consumer, error) {
+	if baseGroupID == "" {
+		return nil, errors.New("kafka.NewReplayConsumer: baseGroupID must not be empty")
+	}
+	uniqueGroupID := fmt.Sprintf("%s-%d", baseGroupID, time.Now().UnixNano())
+	c, err := NewConsumer(brokers, topic, uniqueGroupID)
+	if err != nil {
+		return nil, err
+	}
+	c.replay = true
+	return c, nil
+}
+
 // Run drives the consume loop until ctx is cancelled. Returns ctx.Err()
 // on graceful shutdown, or a wrapped error if the underlying reader
 // fails in a non-recoverable way.
@@ -153,11 +193,8 @@ func (c *Consumer) Run(ctx context.Context, handler broker.Handler) error {
 			// same byte sequence.
 			log.Printf("kafka.Consumer[%s]: skip undecodable message partition=%d offset=%d: %v",
 				c.groupID, msg.Partition, msg.Offset, err)
-			if commitErr := c.reader.CommitMessages(ctx, msg); commitErr != nil {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				return fmt.Errorf("kafka.Consumer.Run: commit poison pill: %w", commitErr)
+			if commitErr := c.commitOrSkip(ctx, msg); commitErr != nil {
+				return commitErr
 			}
 			continue
 		}
@@ -173,13 +210,28 @@ func (c *Consumer) Run(ctx context.Context, handler broker.Handler) error {
 				c.groupID, env.EventID, env.TxHash, err)
 		}
 
-		if err := c.reader.CommitMessages(ctx, msg); err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			return fmt.Errorf("kafka.Consumer.Run: commit: %w", err)
+		if err := c.commitOrSkip(ctx, msg); err != nil {
+			return err
 		}
 	}
+}
+
+// commitOrSkip is the one place that decides whether an offset
+// advance is persisted to the broker. Non-replay consumers commit;
+// replay consumers (analytics) do not — see NewReplayConsumer's
+// docstring for the why. The in-memory reader cursor advances on
+// the next FetchMessage regardless.
+func (c *Consumer) commitOrSkip(ctx context.Context, msg kafkago.Message) error {
+	if c.replay {
+		return nil
+	}
+	if err := c.reader.CommitMessages(ctx, msg); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("kafka.Consumer.Run: commit: %w", err)
+	}
+	return nil
 }
 
 // invokeWithRetry calls handler up to maxRetries times with
