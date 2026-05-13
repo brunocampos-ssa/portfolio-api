@@ -39,11 +39,27 @@ services:
       KAFKA_NODE_ID: "0"
       KAFKA_PROCESS_ROLES: "controller,broker"
       KAFKA_CONTROLLER_QUORUM_VOTERS: "0@kafka:9093"
-      KAFKA_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
-      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://localhost:9092"
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      # Dual-listener pattern: every Kafka client first connects to a
+      # bootstrap, then follows METADATA back to a specific broker by
+      # the address the broker ADVERTISES. With a single
+      # `localhost:9092` advertised listener, in-compose clients (the
+      # kafka-init and kafka-tail containers below) would be told to
+      # connect to localhost:9092 from inside their OWN container —
+      # which is their loopback, not the kafka container.
+      #
+      # The fix is to expose two listeners and advertise each with
+      # the address that the respective client population can reach:
+      #
+      #   - DOCKER://kafka:29092 → for in-compose clients
+      #   - HOST://localhost:9092 → for processes on the host
+      #
+      # INTER_BROKER_LISTENER_NAME points at DOCKER so any future
+      # multi-node cluster talks to itself by service name.
+      KAFKA_LISTENERS: "HOST://:9092,DOCKER://:29092,CONTROLLER://:9093"
+      KAFKA_ADVERTISED_LISTENERS: "HOST://localhost:9092,DOCKER://kafka:29092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,HOST:PLAINTEXT,DOCKER:PLAINTEXT"
       KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
-      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "DOCKER"
       # Auto-create topics is a dev-only safety net. The kafka-init
       # service below pre-creates wallet.events.v1 with the right
       # partition count; auto-create only kicks in if you publish to
@@ -52,6 +68,9 @@ services:
       # Required for KRaft: a stable cluster ID used at format-time.
       CLUSTER_ID: "portfolio-cluster-0000000000000"
     healthcheck:
+      # Healthcheck runs INSIDE the kafka container, so localhost:9092
+      # (HOST listener) is valid here — the metadata-redirect issue
+      # only bites cross-container clients.
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
       interval: 5s
       timeout: 5s
@@ -83,13 +102,13 @@ services:
       - /bin/bash
       - -ec
       - |
-        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 \
           --create --if-not-exists \
           --topic wallet.events.v1 \
           --partitions 3 \
           --replication-factor 1
         echo "kafka-init: topics ready"
-        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 \
           --describe --topic wallet.events.v1
     restart: "no"
 
@@ -115,7 +134,7 @@ services:
         condition: service_healthy
     entrypoint:
       - /opt/kafka/bin/kafka-console-consumer.sh
-      - --bootstrap-server=kafka:9092
+      - --bootstrap-server=kafka:29092
       - --topic=wallet.events.v1
       - --from-beginning
       - --property=print.timestamp=true
